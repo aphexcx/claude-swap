@@ -340,6 +340,11 @@ class PollEvent(AutoSwitchEvent):
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
+    # account number → compact plan-tier label ("Team std · no Fable") for
+    # accounts whose tier is known. Additive field: a seat that lost its
+    # Fable window used to be indistinguishable from an incomplete snapshot
+    # in the tick line.
+    tiers: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -353,17 +358,23 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.weekly_threshold is not None:
             fields["weeklyThreshold"] = self.weekly_threshold
+        if self.tiers:
+            fields["planTiers"] = self.tiers
         return fields
 
     def _describe(self, num: str) -> str:
         wins = self.windows.get(num)
         if wins:
-            return " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
-        h = self.headroom.get(num)
-        if h is not None:
-            return f"{100 - h:.0f}%"
-        err = self.fetch_errors.get(num)
-        return f"? ({err})" if err else "?"
+            body = " · ".join(f"{name} {pct:.0f}%" for name, pct in wins.items())
+        else:
+            h = self.headroom.get(num)
+            if h is not None:
+                body = f"{100 - h:.0f}%"
+            else:
+                err = self.fetch_errors.get(num)
+                body = f"? ({err})" if err else "?"
+        tier = self.tiers.get(num)
+        return f"{body} · {tier}" if tier else body
 
     def human(self) -> str:
         if self.active is None:
@@ -1244,6 +1255,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                tiers=self._plan_tier_labels(),
             )
         )
 
@@ -2561,6 +2573,17 @@ class AutoSwitchEngine:
         return [num for _, num in qualifying], any_known, active_reset_ts
 
     # -- adaptive usage scheduling ---------------------------------------------
+
+    def _plan_tier_labels(self) -> dict[str, str]:
+        """Compact tier labels for the tick line — a pure roster read, and
+        optional: a switcher double without it (tests) simply yields none."""
+        getter = getattr(self.switcher, "plan_tier_labels", None)
+        if getter is None:
+            return {}
+        try:
+            return dict(getter())
+        except Exception:  # never let a label lookup break a tick
+            return {}
 
     def _collect_scheduled_usage(
         self,
