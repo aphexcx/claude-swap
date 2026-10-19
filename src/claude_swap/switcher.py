@@ -4372,6 +4372,17 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
+    def account_auth_snapshot(self, number: str, email: str, org_uuid: str | None = None):
+        """Read a gateway endpoint and its credential as one roster generation."""
+        with FileLock(self.lock_file):
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(number, {})
+            if record.get("email") != email or (
+                org_uuid is not None and (record.get("organizationUuid") or "") != org_uuid
+            ):
+                raise AccountNotFoundError("Account changed while preparing authentication; retry")
+            key = self._read_account_credentials(number, email) if record.get("kind") == "gateway" else ""
+            return dict(record), key or ""
+
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
@@ -5444,14 +5455,16 @@ class ClaudeAccountSwitcher:
 
         for num, info in info_by_num.items():
             if sentinels.get(num) == "gateway":
-                record = (
-                    (self._get_sequence_data() or {}).get("accounts", {}).get(num, {})
-                )
+                record, key = self.account_auth_snapshot(num, *identities[num])
+                if record.get("kind") != "gateway":
+                    sentinels.pop(num, None)
+                    entries[num] = UsageEntry()
+                    continue
                 entries[num] = store.collect_gateway(
                     num,
                     identities[num],
                     record,
-                    info[5],
+                    key,
                     active=info[4],
                     fetch=fetch is None or num in fetch,
                 )

@@ -3174,3 +3174,34 @@ def test_gateway_malformed_base_url_names_settings_file(share_setup, value):
     path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": value}}))
     with pytest.raises(SessionError, match=str(path)):
         manager._sync_sharing(profile, share=True)
+
+
+def test_gateway_launch_snapshots_endpoint_and_key_together(manager, capture_exec, monkeypatch):
+    from claude_swap import gateway
+    from claude_swap.locking import FileLock
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=7)
+    read = s._read_account_credentials
+    attempted = []
+    def racing_read(num, email):
+        if num == "7":
+            lock = FileLock(s.lock_file)
+            acquired = lock.acquire(timeout=0)
+            attempted.append(acquired)
+            if acquired:
+                try:
+                    data = s._get_sequence_data()
+                    data["accounts"]["7"]["baseUrl"] = "https://new.example"
+                    s._write_json(s.sequence_file, data)
+                    s._write_account_credentials(num, email, KEY + "-replacement")
+                finally:
+                    lock.release()
+        return read(num, email)
+    monkeypatch.setattr(s, "_read_account_credentials", racing_read)
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("7", [])
+    assert attempted
+    pair = (exc.value.env["ANTHROPIC_BASE_URL"], exc.value.env["ANTHROPIC_AUTH_TOKEN"])
+    assert pair in [("https://old.example", KEY), ("https://new.example", KEY + "-replacement")]
