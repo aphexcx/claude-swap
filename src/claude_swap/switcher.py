@@ -1221,72 +1221,73 @@ class ClaudeAccountSwitcher:
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
-        staging: dict[str, Path] = {}
-        try:
-            if email_a == email_b:
-                # Same email: the two slots' backup keys fully overlap, so
-                # every write below overwrites the other account's material.
-                # Park durable copies first — a failure mid-write can then
-                # never leave a credential existing only in this process's
-                # memory. (Staging fails -> abort before anything changed.)
-                staging = self._stage_overlap_material(
-                    {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+        with self._gateway_account_write([num_a, num_b]):
+            staging: dict[str, Path] = {}
+            try:
+                if email_a == email_b:
+                    # Same email: the two slots' backup keys fully overlap, so
+                    # every write below overwrites the other account's material.
+                    # Park durable copies first — a failure mid-write can then
+                    # never leave a credential existing only in this process's
+                    # memory. (Staging fails -> abort before anything changed.)
+                    staging = self._stage_overlap_material(
+                        {num_a: (creds_a, config_a), num_b: (creds_b, config_b)}
+                    )
+
+                # Move each session profile to its owner's new slot key. When both
+                # accounts share an email the two paths swap directly, so stage the
+                # first through a temporary name.
+                self._swap_session_dirs(num_a, email_a, num_b, email_b)
+
+                # Set each destination key to its owner's exact state: write
+                # material that exists, actively clear what doesn't. An empty
+                # source must never leave the destination serving leftover
+                # material — the other account's (same-email overlap, where no
+                # separate old-key cleanup runs) or a stale file leaked by an
+                # earlier crash. The old keys are cleared only after the commit
+                # below, so the records never point at missing material.
+                if creds_a:
+                    self._write_account_credentials(num_b, email_a, creds_a)
+                else:
+                    self._delete_account_credentials_strict(num_b, email_a)
+                if config_a:
+                    self._write_account_config(num_b, email_a, config_a)
+                else:
+                    self._delete_config_backup(num_b, email_a)
+                if creds_b:
+                    self._write_account_credentials(num_a, email_b, creds_b)
+                else:
+                    self._delete_account_credentials_strict(num_a, email_b)
+                if config_b:
+                    self._write_account_config(num_a, email_b, config_b)
+                else:
+                    self._delete_config_backup(num_a, email_b)
+
+                data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
+                int_a, int_b = int(num_a), int(num_b)
+                # Renumber, then sort: sequence is kept sorted everywhere (add
+                # sorts on insert), so rotation and list order follow the new
+                # slot numbers instead of preserving the old visual positions.
+                data["sequence"] = [
+                    int_b if n == int_a else int_a if n == int_b else n
+                    for n in data.get("sequence", [])
+                ]
+                data["sequence"].sort()
+                active = data.get("activeAccountNumber")
+                if active == int_a:
+                    data["activeAccountNumber"] = int_b
+                elif active == int_b:
+                    data["activeAccountNumber"] = int_a
+                data["lastUpdated"] = get_timestamp()
+                # The commit point: _write_json's rename publishes the swap.
+                self._write_json(self.sequence_file, data)
+            except BaseException:
+                self._rollback_swap(
+                    num_a, email_a, creds_a, config_a,
+                    num_b, email_b, creds_b, config_b,
+                    staging,
                 )
-
-            # Move each session profile to its owner's new slot key. When both
-            # accounts share an email the two paths swap directly, so stage the
-            # first through a temporary name.
-            self._swap_session_dirs(num_a, email_a, num_b, email_b)
-
-            # Set each destination key to its owner's exact state: write
-            # material that exists, actively clear what doesn't. An empty
-            # source must never leave the destination serving leftover
-            # material — the other account's (same-email overlap, where no
-            # separate old-key cleanup runs) or a stale file leaked by an
-            # earlier crash. The old keys are cleared only after the commit
-            # below, so the records never point at missing material.
-            if creds_a:
-                self._write_account_credentials(num_b, email_a, creds_a)
-            else:
-                self._delete_account_credentials_strict(num_b, email_a)
-            if config_a:
-                self._write_account_config(num_b, email_a, config_a)
-            else:
-                self._delete_config_backup(num_b, email_a)
-            if creds_b:
-                self._write_account_credentials(num_a, email_b, creds_b)
-            else:
-                self._delete_account_credentials_strict(num_a, email_b)
-            if config_b:
-                self._write_account_config(num_a, email_b, config_b)
-            else:
-                self._delete_config_backup(num_a, email_b)
-
-            data["accounts"][num_a], data["accounts"][num_b] = record_b, record_a
-            int_a, int_b = int(num_a), int(num_b)
-            # Renumber, then sort: sequence is kept sorted everywhere (add
-            # sorts on insert), so rotation and list order follow the new
-            # slot numbers instead of preserving the old visual positions.
-            data["sequence"] = [
-                int_b if n == int_a else int_a if n == int_b else n
-                for n in data.get("sequence", [])
-            ]
-            data["sequence"].sort()
-            active = data.get("activeAccountNumber")
-            if active == int_a:
-                data["activeAccountNumber"] = int_b
-            elif active == int_b:
-                data["activeAccountNumber"] = int_a
-            data["lastUpdated"] = get_timestamp()
-            # The commit point: _write_json's rename publishes the swap.
-            self._write_json(self.sequence_file, data)
-        except BaseException:
-            self._rollback_swap(
-                num_a, email_a, creds_a, config_a,
-                num_b, email_b, creds_b, config_b,
-                staging,
-            )
-            raise
+                raise
 
         # Post-commit cleanup, all best-effort: the records already reference
         # the new keys only. A failure here leaks a stale file, never a wrong
