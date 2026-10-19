@@ -108,10 +108,17 @@ def owned_slot(value: object) -> str | None:
         return None
     try:
         parts = shlex.split(value)
-        if len(parts) == 3 and parts[1] == "gateway-credential" and int(parts[2]) > 0:
-            slot = str(int(parts[2]))
-            if value == helper(slot):
-                return slot
+        if (
+            len(parts) == 3
+            and Path(parts[0]).name in ("cswap", "claude-swap", "cswap.exe", "claude-swap.exe")
+            and parts[1] == "gateway-credential"
+            and parts[2].isdigit()
+            and int(parts[2]) > 0
+        ):
+            # Both installed entry points own this command. The invoking
+            # alias (or its current location on PATH) need not be the one
+            # that wrote the settings file.
+            return str(int(parts[2]))
     except (ValueError, OSError):
         pass
     return None

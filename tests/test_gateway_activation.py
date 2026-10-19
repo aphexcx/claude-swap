@@ -19,6 +19,20 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("first,second", [("claude-swap", "cswap"), ("cswap", "claude-swap")])
+    def test_gateway_return_across_cli_aliases(self, gateway_switcher, monkeypatch, first, second):
+        s = gateway_switcher
+        seed_oauth(s)
+        monkeypatch.setattr(gateway, "executable", lambda: f"/fake/bin/{first}")
+        s.switch_to("2", json_output=True)
+        monkeypatch.setattr(gateway, "executable", lambda: f"/fake/bin/{second}")
+        result = s.switch_to("1", json_output=True)
+        assert result["switched"]
+        assert result["from"]["number"] == 2
+        settings = json.loads(s._gateway_settings_path().read_text())
+        assert "apiKeyHelper" not in settings
+        assert settings["env"]["ANTHROPIC_BASE_URL"] == gateway.FIRST_PARTY_URL
+
     @pytest.mark.parametrize("operation", ["move", "swap", "move-occupied"])
     def test_active_gateway_renumber_refused(self, gateway_switcher, operation):
         s = gateway_switcher
