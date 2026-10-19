@@ -1113,7 +1113,12 @@ class SessionManager:
         source = source or path
         if not source.exists() and not (gateway_session and session_dir.is_dir()):
             return
-        settings = gateway.read_settings(source)
+        try:
+            settings = gateway.read_settings(source)
+        except ValueError:
+            raise SessionError(
+                f"Cannot read Claude settings file {source}; repair it before retrying"
+            ) from None
         if gateway_session or gateway.owned_slot(settings.get("apiKeyHelper")) is not None:
             settings.pop("apiKeyHelper", None)
         env = settings.setdefault("env", {})
