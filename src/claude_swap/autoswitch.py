@@ -1592,7 +1592,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger, left_snapshot, expected_source=current)
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant"):
                 continue
@@ -1615,7 +1615,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger, left_snapshot, expected_source=current)
 
         if systemic or transient_failure:
             self._emit(

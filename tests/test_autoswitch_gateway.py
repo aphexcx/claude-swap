@@ -36,11 +36,13 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 class TestAutoswitchGateway:
     @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
-    def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase):
+    @pytest.mark.parametrize("origin", ["gateway", "oauth"])
+    def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase, origin):
         h = fleet(temp_home, monkeypatch)
         s = h.switcher
         s.add_account_from_token(KEY + "-b", slot=4, base_url="https://b.example")
-        s.switch_to("3", json_output=True)
+        if origin == "gateway":
+            s.switch_to("3", json_output=True)
         activated = []
         def activate_other():
             if not activated:
