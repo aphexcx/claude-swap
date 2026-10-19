@@ -243,3 +243,25 @@ def test_add_token_numeric_alias_is_validation_error(gateway_switcher, monkeypat
     output = capsys.readouterr()
     assert "Error:" in output.err + output.out
     assert "Traceback" not in output.err + output.out
+
+
+def test_forced_import_preflights_all_accounts_before_active_gateway_refusal(gateway_switcher, temp_home):
+    from tests.test_gateway_activation import seed_oauth
+
+    s = gateway_switcher
+    seed_oauth(s)
+    s.switch_to("2", json_output=True)
+    path = temp_home / "mixed-export.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    envelope["accounts"][0]["credentials"]["claudeAiOauth"]["refreshToken"] = "replacement-refresh"
+    envelope["accounts"][1]["baseUrl"] = "https://other.example"
+    path.write_text(json.dumps(envelope))
+    credentials = {n: s.read_account_credentials(n, s.account_email(n)) for n in ("1", "2")}
+    sequence = s.sequence_file.read_bytes()
+    settings = s._gateway_settings_path().read_bytes()
+    with pytest.raises(ValidationError, match="Switch away from the active gateway"):
+        import_accounts(s, str(path), force=True)
+    assert {n: s.read_account_credentials(n, s.account_email(n)) for n in ("1", "2")} == credentials
+    assert s.sequence_file.read_bytes() == sequence
+    assert s._gateway_settings_path().read_bytes() == settings

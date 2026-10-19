@@ -476,6 +476,14 @@ def import_accounts(
 
 def _import_accounts_locked(switcher, envelope, normalized, force):
     """Keep replacement validation and all writes under the roster lock."""
+    data = switcher._get_sequence_data_migrated() or {}
+    for entry in normalized:
+        slot = switcher._find_account_slot(data, entry["email"], entry["org_uuid"])
+        if slot is not None and (force or switcher._slot_token_dead(slot, entry["email"])):
+            try:
+                switcher._refuse_active_gateway_replacement(data, slot)
+            except ConfigError as exc:
+                raise ValidationError(str(exc)) from None
     imported = 0
     skipped = 0
     overwritten = 0
