@@ -1131,6 +1131,7 @@ class ClaudeAccountSwitcher:
             raise AccountNotFoundError(f"Account-{num_a} does not exist")
         if not record_b:
             raise AccountNotFoundError(f"Account-{num_b} does not exist")
+        self._refuse_active_gateway_renumber(data, num_a, num_b)
 
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
@@ -1564,6 +1565,19 @@ class ClaudeAccountSwitcher:
             self._relocate_locked(num_src, target)
             return num_src, target, False
 
+    def _refuse_active_gateway_renumber(self, data: dict, *slots: str) -> None:
+        # Called under the account lock, before any relocation writes. The
+        # settings helper names a slot; leave changing it to switch's full
+        # settings transaction rather than risk serving the wrong key.
+        active = gateway.active_slot(
+            self._gateway_settings_path(), data.get("accounts", {})
+        )
+        if active in slots:
+            raise ValidationError(
+                f"Cannot renumber active gateway Account-{active}; switch away "
+                "from it before moving or swapping its slot"
+            )
+
     def _relocate_locked(self, num_src: str, target: str) -> None:
         """Move one account from ``num_src`` to the empty slot ``target``.
 
@@ -1582,6 +1596,7 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(num_src)
         if not record:
             raise AccountNotFoundError(f"Account-{num_src} does not exist")
+        self._refuse_active_gateway_renumber(data, num_src)
         if data.get("accounts", {}).get(target):
             raise ValidationError(
                 f"Slot {target} is already occupied — retry the move"

@@ -6,7 +6,7 @@ import sys
 import pytest
 
 from claude_swap import gateway
-from claude_swap.exceptions import SwitchError
+from claude_swap.exceptions import SwitchError, ValidationError
 from claude_swap.paths import get_credentials_path, get_global_config_path
 from tests.test_gateway_accounts import KEY
 from tests.test_gateway_accounts import gateway_switcher as gateway_switcher
@@ -19,6 +19,25 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("operation", ["move", "swap", "move-occupied"])
+    def test_active_gateway_renumber_refused(self, gateway_switcher, operation):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=3)
+        s.switch_to("2", json_output=True)
+        sequence = s.sequence_file.read_bytes()
+        settings = s._gateway_settings_path().read_bytes()
+        with pytest.raises(ValidationError, match="active gateway.*switch away"):
+            if operation == "move":
+                s.move_account("2", "4")
+            elif operation == "swap":
+                s.swap_accounts("3", "2")
+            else:
+                s.move_account("3", "2")
+        assert s.sequence_file.read_bytes() == sequence
+        assert s._gateway_settings_path().read_bytes() == settings
+        assert s.gateway_credential("2") == KEY
+
     def test_return_keeps_oauth_backup_rotated_while_gateway_active(
         self, gateway_switcher
     ):
