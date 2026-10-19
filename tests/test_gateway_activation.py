@@ -20,6 +20,25 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("force", [False, True])
+    def test_gateway_identity_match_does_not_replace_settings_activation(self, gateway_switcher, force):
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s.account_email("1")
+        live = s._read_credentials()
+        s.remove_account("1", assume_yes=True)
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=3, email=email)
+        assert s.current_account_number() is None
+        assert s.status(json_output=True)["active"] == {"email": email, "managed": False}
+        assert not any(info[4] for info in s._build_accounts_info())
+        assert s.switch(json_output=True)["reason"] == "unmanaged-account"
+        result = s.switch_to("3", json_output=True, force=force)
+        assert result["switched"] and result["from"]["number"] is None
+        assert s.current_account_number() == "3"
+        assert s.gateway_credential("3") == KEY
+        assert s._read_credentials() == live
+        assert s.switch_to("3", json_output=True)["reason"] == "already-active"
+
     def test_live_add_refuses_oauth_refresh_of_inactive_gateway(self, gateway_switcher, monkeypatch):
         s = gateway_switcher
         seed_oauth(s)
