@@ -4214,6 +4214,9 @@ class ClaudeAccountSwitcher:
                 self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
+                self._reject_cross_kind_collision(
+                    email, is_api_key, kind="gateway" if gateway_fields else None
+                )
                 with self._gateway_account_write([account_num], gateway_requested=bool(gateway_fields)):
                     self._write_account_credentials(account_num, email, credentials)
                     self._write_account_config(account_num, email, config)
@@ -4295,6 +4298,9 @@ class ClaudeAccountSwitcher:
             self._validate_account_write_targets(expected_records)
             self._refuse_active_gateway_replacement(
                 self._get_sequence_data() or {}, account_num, migrate_from
+            )
+            self._reject_cross_kind_collision(
+                email, is_api_key, kind="gateway" if gateway_fields else None
             )
             if displace_slot:
                 self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")

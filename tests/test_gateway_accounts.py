@@ -469,6 +469,32 @@ def test_gateway_add_token_rechecks_identity_after_slot_swap(gateway_switcher, m
     assert (row["baseUrl"], key) == ("https://a.example", KEY)
 
 
+@pytest.mark.parametrize("slot", [None, 1])
+@pytest.mark.parametrize("token", ["sk-ant-oat01-dummy", "sk-ant-api03-dummy"])
+def test_gateway_add_token_rechecks_kind_after_initial_validation(gateway_switcher, monkeypatch, slot, token):
+    s = gateway_switcher
+    email = "same@example.com"
+    s.add_account_from_token(token, email=email, slot=1)
+    other = ClaudeAccountSwitcher()
+    other.platform = Platform.LINUX
+    check = s._reject_cross_kind_collision
+    replaced = []
+
+    def race(*args, **kwargs):
+        check(*args, **kwargs)
+        if not replaced:
+            replaced.append(True)
+            other.remove_account("1", assume_yes=True)
+            other.add_account_from_token(KEY, email=email, slot=1, base_url="https://gateway.example")
+
+    monkeypatch.setattr(s, "_reject_cross_kind_collision", race)
+    with pytest.raises(ValidationError, match="already exists"):
+        s.add_account_from_token(token + "-new", email=email, slot=slot)
+    row, key = s.account_auth_snapshot("1", email)
+    assert (row["kind"], row["baseUrl"], key) == ("gateway", "https://gateway.example", KEY)
+    assert not s._account_write_marker("1").exists()
+
+
 @pytest.mark.parametrize("operation", ["refresh", "slot", "import"])
 @pytest.mark.parametrize("failure", ["config", "cache", "sequence", "after-sequence"])
 def test_gateway_failed_replacement_refuses_credentials_until_retry(gateway_switcher, temp_home, monkeypatch, operation, failure):
