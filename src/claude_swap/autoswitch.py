@@ -1114,6 +1114,12 @@ class AutoSwitchEngine:
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
+        if self.switcher.account_kind_for(current) == "gateway":
+            # A previous OAuth idle hold must not suppress candidate polls
+            # for the gateway, whose own probe now controls departure.
+            self._idle_hold_since = None
+            self._idle_hold_slow = False
+            self._unhealthy_ticks = 0
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,

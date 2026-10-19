@@ -227,3 +227,40 @@ def test_gateway_return_quarantine_survives_second_tick(temp_home, monkeypatch, 
     assert h.active_number() == 3
     assert h.state()["quarantine"]["2"]["reason"] == reason
     assert refresh.call_count == 1
+
+
+def test_gateway_real_collector_resumes_after_oauth_idle_hold(temp_home, monkeypatch):
+    from dataclasses import replace
+    from claude_swap.autoswitch import IDLE_HOLD_MAX_S
+    from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+
+    h = fleet(temp_home, monkeypatch)
+    h.switcher.remove_account("2", assume_yes=True)
+    h.engine.settings = replace(h.settings, unhealthy_ticks=1)
+    recovered = False
+    polled = []
+
+    def fetch(infos, pre):
+        polled.extend(str(i[0]) for i in infos)
+        return {str(i[0]): FetchRecord(usage=_usage(10)) if recovered
+                else FetchRecord(sentinel=USAGE_TOKEN_EXPIRED) for i in infos}
+
+    monkeypatch.setattr(h.switcher, "_run_usage_fetches", fetch)
+    status = "ok"
+    monkeypatch.setattr(gateway, "probe", lambda *a, **kw: dict(
+        probeStatus=status, probedAt=kw["now"], retryAt=None, budget=None))
+    assert h.engine.tick() == TickOutcome.NO_ACTION
+    assert h.engine._idle_hold_since is not None
+    h.clock.advance(IDLE_HOLD_MAX_S + 1)
+    assert h.engine.tick() == TickOutcome.SWITCHED
+    assert h.active_number() == 3
+    recovered = True
+    status = "exhausted"
+    polled.clear()
+    h.clock.advance(601)
+    assert h.engine.tick() == TickOutcome.SWITCHED
+    assert polled == ["1"]
+    assert h.active_number() == 1
+    assert h.engine._idle_hold_since is None
+    assert not h.engine._idle_hold_slow
+    assert h.engine._unhealthy_ticks == 0
