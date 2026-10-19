@@ -34,6 +34,21 @@ def respond(monkeypatch, status, message="", retry=None):
 
 
 class TestGatewayProbe:
+    def test_transient_since_persists_and_resets_after_recovery(self, monkeypatch):
+        record = gateway.account_fields("https://gateway.example")
+        respond(monkeypatch, 500)
+        first = gateway.probe(record, KEY, now=1000)
+        assert first["transientSince"] == 1000
+        opener = respond(monkeypatch, 500)
+        opener.open.side_effect = URLError(KEY)
+        second = gateway.probe(record, KEY, now=1601, previous=first)
+        assert second["transientSince"] == 1000
+        respond(monkeypatch, 200)
+        recovered = gateway.probe(record, KEY, now=1700, previous=second)
+        assert "transientSince" not in recovered
+        respond(monkeypatch, 404)
+        assert gateway.probe(record, KEY, now=1800, previous=recovered)["transientSince"] == 1800
+
     @pytest.mark.parametrize("status", [503, 529])
     def test_cooling_collection_obeys_growing_retry_deadline(self, temp_home, monkeypatch, status):
         now = [1000.0]

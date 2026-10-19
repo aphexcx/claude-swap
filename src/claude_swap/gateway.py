@@ -29,6 +29,7 @@ CANDIDATE_INTERVAL_S = 600
 EXHAUSTED_INTERVAL_S = 900
 COOLING_INTERVAL_S = 60
 COOLING_MAX_S = 600
+TRANSIENT_MAX_S = 600
 DEFAULT_RETRY_S = 3600
 JITTER_FRAC = 0.1
 TIMEOUT_S = 15
@@ -314,6 +315,8 @@ def probe(
     except Exception:
         # Never return repr/str of an exception containing a Request or header.
         result.update(errorType="request_error", message="Gateway probe failed")
+    if result["probeStatus"] == "transient":
+        result["transientSince"] = previous.get("transientSince", now)
     return result
 
 
