@@ -3694,6 +3694,15 @@ class ClaudeAccountSwitcher:
             return None
         return num
 
+    def _validate_token_alias(self, email: str, alias: str | None) -> None:
+        """Check the requested alias; repeat under the token write lock."""
+        if alias is None:
+            return
+        existing_slot = self._find_account_slot(self._get_sequence_data() or {}, email, "")
+        conflict = self._alias_in_use(alias, exclude_num=existing_slot)
+        if conflict is not None:
+            raise ConfigError(f"Alias '{alias}' is already used by account {conflict}")
+
     def _resolve_account_identifier(self, identifier: str) -> str | None:
         """Resolve account identifier (number, alias, or email) to account number.
 
@@ -4181,15 +4190,7 @@ class ClaudeAccountSwitcher:
         self._reject_cross_kind_collision(
             email, is_api_key, kind="gateway" if gateway_fields else None
         )
-        if alias is not None:
-            existing_slot = self._find_account_slot(
-                self._get_sequence_data(), email, ""
-            )
-            conflict = self._alias_in_use(alias, exclude_num=existing_slot)
-            if conflict is not None:
-                raise ConfigError(
-                    f"Alias '{alias}' is already used by account {conflict}"
-                )
+        self._validate_token_alias(email, alias)
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -4229,6 +4230,7 @@ class ClaudeAccountSwitcher:
                 self._reject_cross_kind_collision(
                     email, is_api_key, kind="gateway" if gateway_fields else None
                 )
+                self._validate_token_alias(email, alias)
                 with self._gateway_account_write([account_num], gateway_requested=bool(gateway_fields)):
                     self._write_account_credentials(account_num, email, credentials)
                     self._write_account_config(account_num, email, config)
@@ -4314,6 +4316,7 @@ class ClaudeAccountSwitcher:
             self._reject_cross_kind_collision(
                 email, is_api_key, kind="gateway" if gateway_fields else None
             )
+            self._validate_token_alias(email, alias)
             if displace_slot:
                 self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")
             if migrate_from:
