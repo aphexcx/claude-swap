@@ -337,6 +337,7 @@ def import_accounts(
     Raises:
         TransferError: malformed file, version mismatch, encrypted payload.
     """
+    switcher._refuse_session_shell()
     if source == "-":
         text = sys.stdin.read()
     else:

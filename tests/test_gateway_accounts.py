@@ -231,6 +231,63 @@ def test_forced_import_refuses_active_gateway_replacement(gateway_switcher, temp
     assert s.gateway_credential("1") == KEY
 
 
+@pytest.mark.parametrize("replacement", ["url", "kind"])
+def test_gateway_import_from_session_shell_refuses_default_replacement(gateway_switcher, temp_home, monkeypatch, replacement):
+    from claude_swap.exceptions import SwitchError
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, slot=1, base_url="https://gateway.example")
+    s.switch_to("1", json_output=True)
+    path = temp_home / "replacement.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    row = envelope["accounts"][0]
+    if replacement == "url":
+        row["baseUrl"] = "https://new.example"
+    else:
+        row["kind"] = "oauth"
+        row["credentials"] = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-dummy"}}
+    path.write_text(json.dumps(envelope))
+    settings_path = s._gateway_settings_path()
+    settings, sequence = settings_path.read_bytes(), s.sequence_file.read_bytes()
+    profile = s._session_dir("9", "session@example.com")
+    profile.mkdir(parents=True)
+    (profile / "settings.json").write_text("{}")
+    with monkeypatch.context() as patch:
+        patch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        with pytest.raises(SwitchError, match="session profile"):
+            import_accounts(s, str(path), force=True)
+    assert settings_path.read_bytes() == settings
+    assert s.sequence_file.read_bytes() == sequence
+    assert s.gateway_credential("1") == KEY
+
+
+@pytest.mark.parametrize("slot", [None, 1])
+def test_gateway_add_token_rechecks_alias_under_write_lock(gateway_switcher, monkeypatch, slot):
+    from claude_swap.exceptions import ConfigError
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, slot=1, email="a@example.com", base_url="https://a.example")
+    s.add_account_from_token(KEY + "-b", slot=2, email="b@example.com", base_url="https://b.example")
+    other = ClaudeAccountSwitcher()
+    other.platform = Platform.LINUX
+    check = s._alias_in_use
+    assigned = []
+    def race(*args, **kwargs):
+        result = check(*args, **kwargs)
+        if not assigned:
+            assigned.append(True)
+            other.set_alias("2", "claimed")
+        return result
+    monkeypatch.setattr(s, "_alias_in_use", race)
+    with pytest.raises(ConfigError, match="already used"):
+        s.add_account_from_token(KEY + "-new", slot=slot, email="a@example.com", base_url="https://new.example", alias="claimed")
+    row, key = s.account_auth_snapshot("1", "a@example.com")
+    assert (row["baseUrl"], key) == ("https://a.example", KEY)
+    assert "alias" not in row
+    assert s.resolve_account("claimed")[0] == "2"
+
+
 def test_add_token_numeric_alias_is_validation_error(gateway_switcher, monkeypatch, capsys):
     with pytest.raises(ValidationError):
         gateway_switcher.add_account_from_token(KEY, base_url="https://gateway.example", alias="123")
