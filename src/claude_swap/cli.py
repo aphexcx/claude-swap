@@ -9,7 +9,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, SwitchError
 from claude_swap.json_output import error_envelope
 from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
 from claude_swap.printer import (
@@ -1119,6 +1119,8 @@ def main() -> None:
                     contextlib.redirect_stderr(io.StringIO()),
                 ):
                     key = ClaudeAccountSwitcher().gateway_credential(str(int(argv[1])))
+        except SwitchError:
+            sys.stderr.write("Gateway credentials are unavailable inside a cswap run session profile.\n")
         except Exception:
             pass
         if key is None:

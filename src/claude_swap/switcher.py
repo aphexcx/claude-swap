@@ -7167,6 +7167,7 @@ class ClaudeAccountSwitcher:
 
     def gateway_credential(self, slot: str) -> str | None:
         """The hidden helper has exactly one authorized credential source."""
+        self._refuse_session_shell()
         with FileLock(self.lock_file):
             accounts = (self._get_sequence_data() or {}).get("accounts", {})
             if gateway.active_slot(self._gateway_settings_path(), accounts) != slot:
@@ -7841,6 +7842,9 @@ class ClaudeAccountSwitcher:
           before the XDG migration
         """
         self._refuse_session_shell()
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        if gateway.active_slot(self._gateway_settings_path(), accounts) is not None:
+            raise ConfigError("Switch away from the active gateway before purging")
         legacy = get_legacy_backup_root()
         legacy_distinct = legacy != self.backup_dir
 
