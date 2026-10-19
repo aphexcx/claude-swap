@@ -1185,6 +1185,13 @@ class SessionManager:
             dest = session_dir / name
 
             if name == "settings.json" and isolate_settings:
+                if not src.exists():
+                    if name in managed:
+                        self._remove_managed(dest)
+                        # Keep ownership while the source is absent, so a
+                        # later launch can restore the managed copy.
+                        new_managed.append(name)
+                    continue
                 # Keep shared customizations as a copy. Linking would let a
                 # later default gateway switch change this session's auth.
                 source = src if name in managed or not dest.exists() or dest.is_symlink() else dest

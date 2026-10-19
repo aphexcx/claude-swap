@@ -3044,3 +3044,20 @@ def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypat
     with pytest.raises(KeyboardInterrupt):
         mgr._write_manifest(tmp_path / ".cswap-shared.json", ["a"])
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_gateway_deleted_shared_settings_remain_managed(share_setup):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager._sync_sharing(profile, share=True)
+    (source / "settings.json").unlink()
+    manager._sync_sharing(profile, share=True)
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+    assert not (profile / "settings.json").exists()
+    (source / "settings.json").write_text('{"theme": "new-theme"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "new-theme"
+    manager._sync_sharing(profile, share=False)
+    assert not (profile / "settings.json").exists()
