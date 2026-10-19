@@ -3229,3 +3229,18 @@ def test_oauth_launch_scrubs_registered_gateway_environment(
         else:
             assert env["ANTHROPIC_BASE_URL"] == url
             assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+
+
+def test_gateway_generated_settings_adopt_later_shared_source(manager, temp_home):
+    from tests.test_gateway_accounts import KEY
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.unlink(missing_ok=True)
+    profile, _, _ = manager.setup_session("7", share=True)
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+    source.write_text('{"theme":"later"}')
+    manager.setup_session("7", share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "later"
+    manager.setup_session("7", share=False)
+    assert "theme" not in json.loads((profile / "settings.json").read_text())
+    assert not (profile / SHARE_MANIFEST).exists()
