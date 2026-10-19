@@ -595,6 +595,7 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        prepared_kind = self.switcher._account_kind(account_num)
         # Guard before the same-account direct-launch fast path below (which
         # _exec's claude and never returns) — and before setup_session.
         self._ensure_not_api_key(account_num, email)
@@ -640,7 +641,7 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, expected_kind=prepared_kind
         )
 
         print(
@@ -652,6 +653,8 @@ class SessionManager:
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         record, key = self.switcher.account_auth_snapshot(account_num, email, org_uuid)
+        if record.get("kind", "oauth") != prepared_kind:
+            raise SessionError("Account kind changed during session preparation; retry")
         if record.get("kind") == "gateway":
             if not key:
                 raise SessionError("Gateway account has no stored credential")
@@ -719,14 +722,18 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self, identifier: str, share: bool, share_history: bool = False,
+        *, expected_kind: str | None = None,
     ) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        prepared_kind = self.switcher._account_kind(account_num)
+        if expected_kind is not None and prepared_kind != expected_kind:
+            raise SessionError("Account kind changed during session preparation; retry")
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
-        if self.switcher._account_kind(account_num) == "gateway":
+        if prepared_kind == "gateway":
             _mkdir_private(session_dir)
             self._sync_sharing(session_dir, share, share_history, gateway_session=True)
             self._isolate_auth_settings(session_dir, gateway_session=True)
@@ -818,6 +825,12 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            record = (self.switcher._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
+            if (record.get("kind", "oauth") != prepared_kind
+                    or record.get("email") != email
+                    or (record.get("organizationUuid", "") or "") != org_uuid):
+                raise SessionError("Account changed during session preparation; retry")
+            self.switcher._refuse_pending_account_write(account_num)
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if is_session_stale(session_dir) and profile_is_quiescent(session_dir):
