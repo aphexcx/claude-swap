@@ -281,11 +281,14 @@ def test_gateway_collection_snapshots_endpoint_and_key_together(gateway_switcher
     assert pairs == [("https://new.example", KEY + "-replacement")]
 
 
-def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, temp_home, monkeypatch):
+@pytest.mark.parametrize("initial_gateway", [True, False])
+def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, temp_home, monkeypatch, initial_gateway):
     from claude_swap.locking import FileLock
 
     s = gateway_switcher
-    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    original_key = KEY if initial_gateway else "sk-ant-api03-" + KEY
+    replacement_key = "sk-ant-api03-" + KEY + "-replacement"
+    s.add_account_from_token(original_key, base_url="https://old.example" if initial_gateway else None, slot=1)
     read = s._read_account_credentials
     attempted = []
 
@@ -296,9 +299,9 @@ def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, te
         if acquired:
             try:
                 data = s._get_sequence_data()
-                data["accounts"][num]["baseUrl"] = "https://new.example"
+                data["accounts"][num].update(kind="gateway", baseUrl="https://new.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
                 s._write_json(s.sequence_file, data)
-                s._write_account_credentials(num, email, KEY + "-replacement")
+                s._write_account_credentials(num, email, replacement_key)
             finally:
                 lock.release()
         return read(num, email)
@@ -308,8 +311,9 @@ def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, te
     export_accounts(s, str(path))
     row = json.loads(path.read_text())["accounts"][0]
     assert attempted
-    assert (row["baseUrl"], row["credentials"]) in [
-        ("https://old.example", KEY), ("https://new.example", KEY + "-replacement"),
+    assert (row.get("baseUrl"), row["credentials"]) in [
+        ("https://old.example" if initial_gateway else None, original_key),
+        ("https://new.example", replacement_key),
     ]
 
 
