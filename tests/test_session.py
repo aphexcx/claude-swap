@@ -3177,6 +3177,68 @@ def test_gateway_malformed_base_url_names_settings_file(share_setup, value):
         manager._sync_sharing(profile, share=True)
 
 
+@pytest.mark.parametrize("initial_kind,final_kind,phase", [
+    ("gateway", "oauth", "prepared"),
+    ("gateway", "api_key", "prepared"),
+    ("oauth", "gateway", "prepared"),
+    ("oauth", "gateway", "bootstrap"),
+])
+def test_gateway_session_refuses_kind_change_during_preparation(
+    manager, capture_exec, temp_home, monkeypatch,
+    initial_kind, final_kind, phase,
+):
+    from claude_swap import gateway
+    from claude_swap.transfer import export_accounts, import_accounts
+    from tests.test_gateway_accounts import KEY
+
+    def auth_status(cmd, env=None, **kwargs):
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        payload = {"loggedIn": (profile / ".credentials.json").exists(),
+                   "authMethod": "claude.ai", "email": "race@example.com", "orgId": ""}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+    monkeypatch.setattr(session_mod.subprocess, "run", auth_status)
+    s = manager.switcher
+    s.add_account_from_token(KEY if initial_kind == "gateway" else "sk-ant-oat01-dummy",
+                             slot=7, email="race@example.com",
+                             base_url="https://gateway.example" if initial_kind == "gateway" else None)
+    path = temp_home / "kind-replacement.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    row = next(r for r in envelope["accounts"] if r["email"] == "race@example.com")
+    envelope["accounts"] = [row]
+    for name in gateway.RECORD_FIELDS:
+        row.pop(name, None)
+    row["kind"] = final_kind
+    row["credentials"] = {"claudeAiOauth": {"accessToken": "sk-ant-oat01-replacement"}} if final_kind == "oauth" else KEY
+    if final_kind == "api_key":
+        row["credentials"] = "sk-ant-api03-" + KEY
+    if final_kind == "gateway":
+        row.update(gateway.account_fields("https://new.example"))
+    path.write_text(json.dumps(envelope))
+    replaced = []
+    def replace_kind():
+        if not replaced:
+            replaced.append(True)
+            import_accounts(s, str(path), force=True)
+    if phase == "prepared":
+        setup = manager.setup_session
+        def prepare(*args, **kwargs):
+            result = setup(*args, **kwargs)
+            replace_kind()
+            return result
+        monkeypatch.setattr(manager, "setup_session", prepare)
+    else:
+        def invalid(*args):
+            replace_kind()
+            return False
+        monkeypatch.setattr(manager, "_is_session_valid", invalid)
+    with pytest.raises(SessionError, match="changed.*retry"):
+        manager.run("7", [])
+    assert replaced
+    if final_kind == "gateway":
+        assert s._read_account_credentials("7", "race@example.com") == KEY
+
+
 def test_gateway_launch_snapshots_endpoint_and_key_together(manager, capture_exec, monkeypatch):
     from claude_swap.locking import FileLock
     from tests.test_gateway_accounts import KEY
