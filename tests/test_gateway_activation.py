@@ -20,6 +20,25 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("token", ["sk-ant-api03-dummy", "sk-ant-oat01-dummy"])
+    def test_gateway_return_keeps_replaced_nonrefreshable_credential(self, gateway_switcher, token):
+        s = gateway_switcher
+        email = "same@example.com"
+        s.add_account_from_token(token, email=email, slot=1)
+        s.switch_to("1", json_output=True)
+        old_live = s._read_credentials()
+        s.add_account_from_token(KEY, slot=2, base_url="https://gateway.example")
+        s.switch_to("2", json_output=True)
+        s.add_account_from_token(token + "-replacement", email=email)
+        replacement = s._read_account_credentials("1", email)
+        s.switch_to("1", json_output=True)
+        assert s._read_account_credentials("1", email) == replacement
+        assert s._read_credentials() == replacement
+        assert old_live != replacement
+        stash = s.list_unclaimed_credentials()
+        assert any(s._store._read_unclaimed_credential(entry_id) == (old_live, False)
+                   for entry_id in stash)
+
     @pytest.mark.parametrize("force", [False, True])
     def test_gateway_identity_match_does_not_replace_settings_activation(self, gateway_switcher, force):
         s = gateway_switcher
