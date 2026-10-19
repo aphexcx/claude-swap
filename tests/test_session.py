@@ -1290,7 +1290,9 @@ def capture_exec(monkeypatch):
 
 
 class TestRun:
-    @pytest.mark.parametrize("existing", [False, True])
+    @pytest.mark.parametrize("existing", [False, pytest.param(
+        True, marks=pytest.mark.skipif(sys.platform == "win32", reason="legacy symlink profile is POSIX-only")
+    )])
     def test_oauth_session_isolated_from_default_gateway(
         self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
         monkeypatch, temp_home, existing,

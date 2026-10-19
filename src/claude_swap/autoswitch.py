@@ -1728,7 +1728,7 @@ class AutoSwitchEngine:
                 return self._perform(num, email, trigger, (None, float("inf")))
         self._emit(
             NoSwitchEvent(
-                reason=failure or "all-exhausted",
+                reason=failure or "gateway-hold",
                 detail="no eligible OAuth account; holding gateway",
             )
         )
