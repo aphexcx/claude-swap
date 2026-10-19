@@ -5379,7 +5379,7 @@ class TestAddAccountFromToken:
     def test_basic_add_stores_account(self, temp_home, capsys):
         """A valid token + email should store the account and print 'Added'."""
         switcher = self._make_switcher(temp_home)
-        with patch.object(switcher, "_write_account_credentials") as mock_creds, \
+        with patch.object(switcher, "_write_account_credentials"), \
              patch.object(switcher, "_write_account_config"):
             switcher.add_account_from_token("sk-ant-oat01-abc", "user@example.com")
 
@@ -9428,7 +9428,7 @@ class TestDegradedReadProvenance:
                  switcher, "_read_account_credentials", return_value=stale
              ), \
              patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
-             patch("claude_swap.oauth.try_fetch_usage_for_account") as mock_fetch:
+             patch("claude_swap.oauth.try_fetch_usage_for_account"):
             result = switcher._fetch_active_usage(
                 "1", "test@example.com", stale
             )
@@ -9668,7 +9668,7 @@ class TestBackupUnreadableDisplay:
         sample_sequence_data: dict,
     ):
         from claude_swap.json_output import (
-            USAGE_KEYCHAIN_UNAVAILABLE, USAGE_NO_CREDENTIALS,
+            USAGE_KEYCHAIN_UNAVAILABLE,
         )
         s = ClaudeAccountSwitcher()
         s.platform = Platform.MACOS
@@ -10631,8 +10631,6 @@ class TestConsumeGateLockFailures:
         from claude_swap.exceptions import LockError as LE
         s = self._switcher(sample_sequence_data)
         s._write_account_credentials("1", "test@example.com", self._OLD)
-
-        from claude_swap.locking import FileLock as real_lock
 
         class FailingLock:
             def __init__(self, *a, **k): pass
