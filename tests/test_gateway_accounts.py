@@ -617,3 +617,56 @@ def test_gateway_pending_replacement_relocation_and_recovery(gateway_switcher, m
         with pytest.raises(ConfigError, match="incomplete.*retry"):
             s.swap_accounts("2", pending) if operation == "swap" else s.move_account("2", pending)
         assert s.sequence_file.read_bytes() == before
+
+
+@pytest.mark.parametrize("failure", ["crash", "rollback", "success"])
+def test_gateway_overlapping_swap_refuses_partial_credentials(gateway_switcher, monkeypatch, failure):
+    import subprocess
+    from claude_swap.exceptions import ConfigError
+
+    s = gateway_switcher
+    email = "same@example.com"
+    s.add_account_from_token(KEY, email=email, slot=1, base_url="https://a.example")
+    data = s._get_sequence_data()
+    data["accounts"]["1"]["organizationUuid"] = "org-a"
+    s._write_json(s.sequence_file, data)
+    s.add_account_from_token(KEY + "-b", email=email, slot=2, base_url="https://b.example")
+    s.add_account_from_token(KEY + "-c", slot=3, base_url="https://c.example")
+    if failure == "crash":
+        child = subprocess.run([sys.executable, "-c", """
+import os
+from claude_swap.models import Platform
+from claude_swap.switcher import ClaudeAccountSwitcher
+s = ClaudeAccountSwitcher()
+s.platform = Platform.LINUX
+write = s._write_account_credentials
+def stop_after_write(*args):
+    write(*args)
+    os._exit(77)
+s._write_account_credentials = stop_after_write
+s.swap_accounts('1', '2')
+"""], capture_output=True, timeout=20)
+        assert child.returncode == 77
+    elif failure == "rollback":
+        write = s._write_account_credentials
+        def fail_after_write(*args):
+            write(*args)
+            raise OSError("injected persistent write failure")
+        with monkeypatch.context() as patch:
+            patch.setattr(s, "_write_account_credentials", fail_after_write)
+            with pytest.raises(ConfigError, match="incomplete.*retry"):
+                s.swap_accounts("1", "2")
+    else:
+        s.swap_accounts("1", "2")
+    fresh = ClaudeAccountSwitcher()
+    fresh.platform = Platform.LINUX
+    for num, endpoint, key in [("1", "https://b.example", KEY + "-b"), ("2", "https://a.example", KEY)]:
+        record, actual = fresh.account_auth_snapshot(num, email)
+        if failure == "success":
+            assert (record["baseUrl"], actual) == (endpoint, key)
+            assert not fresh._account_write_pending(num)
+        else:
+            assert actual == ""
+            with pytest.raises(ConfigError, match="incomplete.*retry"):
+                fresh.resolve_account(num)
+    assert fresh._read_account_credentials("3", fresh.account_email("3")) == KEY + "-c"
