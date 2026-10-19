@@ -35,6 +35,32 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_gateway_promotion_publishes_active_probe_deadline(self, temp_home, monkeypatch):
+        from dataclasses import replace
+
+        h = fleet(temp_home, monkeypatch)
+        h.engine.settings = replace(h.settings, interval_seconds=360)
+        monkeypatch.setattr(h.switcher, "_run_usage_fetches",
+                            lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(100)) for i in infos})
+        probes = []
+        def probe(record, key, **kwargs):
+            probes.append(h.clock())
+            return dict(probeStatus="ok", probedAt=h.clock(), retryAt=None, budget=None)
+        monkeypatch.setattr(gateway, "probe", probe)
+        h.switcher.usage_entries_by_account(fetch={"3"})
+        h.clock.advance(1)
+        h.switcher.switch_to("3", json_output=True)
+        waits = []
+        def wait(delay):
+            waits.append(delay)
+            h.clock.advance(delay)
+            if len(waits) == 2:
+                h.engine.stop()
+        monkeypatch.setattr(h.engine._wake, "wait", wait)
+        assert h.engine.run_loop() == 0
+        assert waits[0] == pytest.approx(gateway.ACTIVE_INTERVAL_S - 1)
+        assert probes[1] - probes[0] == pytest.approx(gateway.ACTIVE_INTERVAL_S)
+
     @pytest.mark.parametrize("mode", ["no-candidates", "reset", "opt-out", "disabled", "quarantined"])
     def test_blocked_loop_obeys_enabled_gateway_recovery_deadline(self, temp_home, monkeypatch, mode):
         from dataclasses import replace

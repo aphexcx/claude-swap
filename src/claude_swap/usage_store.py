@@ -1036,6 +1036,11 @@ class UsageStore:
                 and prior.get("probeStatus") in ("ok", "transient")
             ):
                 due = min(due, prior["probedAt"] + gateway.ACTIVE_INTERVAL_S)
+                # The loop consumes the persisted deadline even when this
+                # read is too early to probe. Publish the promoted cadence.
+                row.update(nextPollAt=due, gatewayActive=True)
+                rows[num] = row
+                self._write_rows(rows)
             if (
                 fetch
                 and prior.get("probeStatus") != "unauthorized"
