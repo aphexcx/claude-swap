@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
 from claude_swap.credentials import looks_like_api_key
+from claude_swap import gateway
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
@@ -209,7 +210,7 @@ def export_accounts(
             and current_identity[1] == org_uuid
         )
 
-        if is_active:
+        if is_active and record.get("kind") != "gateway":
             creds_text = switcher._read_credentials()
             if not creds_text:
                 raise CredentialReadError(
@@ -245,7 +246,8 @@ def export_accounts(
         # API-key accounts store the credential as a raw ``sk-ant-…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
+        is_gateway = record.get("kind") == "gateway"
+        is_api_key = looks_like_api_key(creds_text) or is_gateway
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -264,6 +266,11 @@ def export_accounts(
         }
         if is_api_key:
             entry["kind"] = "api_key"
+        if is_gateway:
+            entry.update(
+                kind="gateway",
+                **{k: record[k] for k in gateway.RECORD_FIELDS if k in record},
+            )
         if record.get("alias"):
             entry["alias"] = record["alias"]
         accounts_payload.append(entry)
@@ -378,9 +385,31 @@ def import_accounts(
             raise TransferError(f"config for {email} must be a JSON object")
         # API-key accounts carry the credential as a raw string; OAuth accounts
         # carry a JSON object.
-        is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
+        is_gateway = raw.get("kind") == "gateway"
+        gateway_fields = {}
+        if is_gateway:
+            try:
+                gateway_fields = gateway.account_fields(
+                    raw.get("baseUrl"),
+                    raw.get("auth", "bearer"),
+                    raw.get("usageUrl"),
+                    raw.get("probeModel", gateway.DEFAULT_MODEL),
+                    raw.get("modelDiscovery", False),
+                )
+            except ValueError as exc:
+                raise TransferError(str(exc)) from None
+        is_api_key = (
+            raw.get("kind") == "api_key" or isinstance(creds_obj, str) or is_gateway
+        )
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+            if not (
+                isinstance(creds_obj, str)
+                and (
+                    bool(creds_obj.strip())
+                    if is_gateway
+                    else looks_like_api_key(creds_obj)
+                )
+            ):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-… key "
                     "(not an OAuth token)"
@@ -423,7 +452,12 @@ def import_accounts(
                 "org_name": raw.get("organizationName", "") or "",
                 "uuid": raw.get("uuid", "") or "",
                 "added": raw.get("added") or get_timestamp(),
-                "kind": "api_key" if is_api_key else "oauth",
+                "kind": "gateway"
+                if is_gateway
+                else "api_key"
+                if is_api_key
+                else "oauth",
+                "gateway_fields": gateway_fields,
                 "alias": alias,
                 "creds_text": creds_text,
                 "config_text": json.dumps(config_obj, indent=2),
@@ -556,6 +590,8 @@ def import_accounts(
         }
         if entry["kind"] == "api_key":
             new_record["kind"] = "api_key"
+        if entry["kind"] == "gateway":
+            new_record.update(entry["gateway_fields"])
         if entry.get("alias"):
             new_record["alias"] = entry["alias"]
         data["accounts"][target_num] = new_record

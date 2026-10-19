@@ -12,6 +12,7 @@ import threading
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -25,7 +26,7 @@ from claude_swap.exceptions import (
     SwitchError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import gateway, oauth, pace
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -237,6 +238,8 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     with no measurement at all shows "usage unavailable" plus the last fetch
     error, so a failing endpoint is visible instead of a silent blank.
     """
+    if entry.sentinel == "gateway":
+        return [gateway.usage_label(entry.gateway)]
     if entry.sentinel is not None:
         out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
@@ -1799,6 +1802,11 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
+                    gateway=(
+                        gateway.json_fields(seq_data["accounts"][n], entries[n].gateway)
+                        if self._account_kind(n) == "gateway"
+                        else None
+                    ),
                 )
             )
         return AccountsSnapshot(
@@ -2870,7 +2878,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if self._account_kind(str(num)) == "gateway" or looks_like_api_key(creds):
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -3161,6 +3169,12 @@ class ClaudeAccountSwitcher:
         Delegates so there is ONE reader: two copies of this drifted apart
         once already, over whether a null ``accountUuid`` normalises to "".
         """
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        slot = gateway.active_slot(self._gateway_settings_path(), accounts)
+        if slot is not None:
+            return accounts[slot]["email"], accounts[slot].get(
+                "organizationUuid", ""
+            ) or ""
         triple = self._get_current_identity_triple()
         return None if triple is None else triple[:2]
 
@@ -3311,7 +3325,8 @@ class ClaudeAccountSwitcher:
             return "oauth"
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(str(account_num), {})
-        return "api_key" if record.get("kind") == "api_key" else "oauth"
+        kind = record.get("kind")
+        return kind if kind in ("api_key", "gateway") else "oauth"
 
     def _reject_identity_drift_since_verify(
         self, verified: tuple[str, str, str]
@@ -3514,7 +3529,9 @@ class ClaudeAccountSwitcher:
                 "'cswap add-token sk-ant-...' instead of 'cswap add'."
             )
 
-    def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
+    def _reject_cross_kind_collision(
+        self, email: str, is_api_key: bool, *, kind: str | None = None
+    ) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
 
@@ -3532,10 +3549,11 @@ class ClaudeAccountSwitcher:
         if slot is None:
             return
         existing_kind = self._account_kind(slot)
-        new_kind = "api_key" if is_api_key else "oauth"
+        new_kind = kind or ("api_key" if is_api_key else "oauth")
         if existing_kind != new_kind:
-            existing_label = "API-key" if existing_kind == "api_key" else "OAuth"
-            new_label = "API-key" if is_api_key else "OAuth"
+            labels = {"api_key": "API-key", "oauth": "OAuth", "gateway": "gateway"}
+            existing_label = labels[existing_kind]
+            new_label = labels[new_kind]
             raise ValidationError(
                 f"'{email}' already exists as an {existing_label} account "
                 f"(slot {slot}); cannot add it as an {new_label} account. "
@@ -3945,6 +3963,13 @@ class ClaudeAccountSwitcher:
         email: str | None = None,
         slot: int | None = None,
         assume_yes: bool = False,
+        *,
+        base_url: str | None = None,
+        auth: str = "bearer",
+        usage_url: str | None = None,
+        probe_model: str = gateway.DEFAULT_MODEL,
+        model_discovery: bool = False,
+        alias: str | None = None,
     ) -> None:
         """Register a raw OAuth setup-token or managed API key as a new account.
 
@@ -3979,7 +4004,19 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        is_api_key = looks_like_api_key(token)
+        try:
+            gateway_fields = (
+                gateway.account_fields(
+                    base_url, auth, usage_url, probe_model, model_discovery
+                )
+                if base_url is not None
+                else {}
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from None
+        if alias is not None:
+            alias = normalize_alias(alias)
+        is_api_key = looks_like_api_key(token) or bool(gateway_fields)
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
@@ -3994,13 +4031,30 @@ class ClaudeAccountSwitcher:
         if not email:
             if slot is None:
                 slot = self._get_next_account_number()
-            label = "api-key" if is_api_key else "setup-token"
+            label = (
+                "gateway"
+                if gateway_fields
+                else "api-key"
+                if is_api_key
+                else "setup-token"
+            )
             email = f"{label}-{slot}@token.local"
 
         # Don't silently overwrite/convert an existing account of the other kind:
         # identity is matched on (email, org) only, so an api-key and an OAuth
         # account sharing an email would be indistinguishable at switch time.
-        self._reject_cross_kind_collision(email, is_api_key)
+        self._reject_cross_kind_collision(
+            email, is_api_key, kind="gateway" if gateway_fields else None
+        )
+        if alias is not None:
+            existing_slot = self._find_account_slot(
+                self._get_sequence_data(), email, ""
+            )
+            conflict = self._alias_in_use(alias, exclude_num=existing_slot)
+            if conflict is not None:
+                raise ConfigError(
+                    f"Alias '{alias}' is already used by account {conflict}"
+                )
 
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
@@ -4041,8 +4095,13 @@ class ClaudeAccountSwitcher:
                 [account_num], {account_num: (email, "")}
             )
             seq["lastUpdated"] = get_timestamp()
+            seq["accounts"][account_num].update(gateway_fields)
+            if alias:
+                seq["accounts"][account_num]["alias"] = alias
             self._write_json(self.sequence_file, seq)
-            kind_label = "API key" if is_api_key else "token"
+            kind_label = (
+                "gateway" if gateway_fields else "API key" if is_api_key else "token"
+            )
             self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
             print(
                 f"{accent(f'Updated {kind_label}')} for Account {account_num} "
@@ -4133,6 +4192,9 @@ class ClaudeAccountSwitcher:
         }
         if is_api_key:
             record["kind"] = "api_key"
+        record.update(gateway_fields)
+        if alias:
+            record["alias"] = alias
         data["accounts"][account_num] = record
         if int(account_num) not in data["sequence"]:
             data["sequence"].append(int(account_num))
@@ -4140,7 +4202,9 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        source_label = "API key" if is_api_key else "token"
+        source_label = (
+            "gateway" if gateway_fields else "API key" if is_api_key else "token"
+        )
         self._logger.info(f"Added account {account_num} from {source_label}: {email}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
@@ -4223,6 +4287,26 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
+        if account_info.get("kind") == "gateway":
+            with (
+                FileLock(self.lock_file),
+                claude_credentials_lock(),
+                claude_config_lock(),
+            ):
+                remaining = [
+                    n
+                    for n, r in data["accounts"].items()
+                    if n != account_num and r.get("kind") == "gateway"
+                ]
+                path = self._gateway_settings_path()
+                active_gateway = gateway.active_slot(path, data["accounts"])
+                if active_gateway == account_num:
+                    raise ConfigError(
+                        "Switch away from the active gateway before removing it"
+                    )
+                if not remaining:
+                    gateway.write_settings(path, None, remove_last=True)
+
         # Remove backup files
         self._delete_account_files(account_num, email)
 
@@ -4267,7 +4351,7 @@ class ClaudeAccountSwitcher:
             alias = account.get("alias", "") or ""
             is_active = str(num) == active_num
 
-            if is_active:
+            if is_active and account.get("kind") != "gateway":
                 active = self._read_active_credentials()
                 creds = active.value or ""
                 self._record_active_verdict(active)
@@ -4983,6 +5067,8 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
+        if self._account_kind(str(num)) == "gateway":
+            return "gateway"
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5305,6 +5391,19 @@ class ClaudeAccountSwitcher:
                 ):
                     sentinels[num] = USAGE_RELOGIN_REQUIRED
 
+        for num, info in info_by_num.items():
+            if sentinels.get(num) == "gateway":
+                record = (
+                    (self._get_sequence_data() or {}).get("accounts", {}).get(num, {})
+                )
+                entries[num] = store.collect_gateway(
+                    num,
+                    identities[num],
+                    record,
+                    info[5],
+                    active=info[4],
+                    fetch=fetch is None or num in fetch,
+                )
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
@@ -5715,7 +5814,11 @@ class ClaudeAccountSwitcher:
             # keying on usageStatus == "ok" must not act on arbitrarily old data.
             accounts.append(
                 account_row(
-                    num, email, org_name, org_uuid, is_active,
+                    num,
+                    email,
+                    org_name,
+                    org_uuid,
+                    is_active,
                     entry.decision_value(),
                     usage_fetched_at=entry.fetched_at,
                     usage_age_s=entry.age_s,
@@ -5728,6 +5831,13 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    gateway_info=(
+                        gateway.json_fields(
+                            seq_data["accounts"][str(num)], entry.gateway
+                        )
+                        if self._account_kind(str(num)) == "gateway"
+                        else None
+                    ),
                 )
             )
         payload = {
@@ -5785,7 +5895,12 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
-            tag = self._get_display_tag(email, org_name, org_uuid)
+            record = seq_data.get("accounts", {}).get(str(num), {})
+            tag = (
+                gateway.tag(record)
+                if record.get("kind") == "gateway"
+                else self._get_display_tag(email, org_name, org_uuid)
+            )
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             if is_active:
@@ -5858,9 +5973,12 @@ class ClaudeAccountSwitcher:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        active = self._read_active_credentials()
-        creds = active.value or ""
-        self._record_active_verdict(active)
+        if self._account_kind(account_num) == "gateway":
+            creds = self._read_account_credentials(account_num, current_email)
+        else:
+            active = self._read_active_credentials()
+            creds = active.value or ""
+            self._record_active_verdict(active)
         info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
         return self._collect_usage_entries([info])[str(account_num)]
 
@@ -5903,6 +6021,14 @@ class ClaudeAccountSwitcher:
             "usageStatus": status,
             "usage": usage,
         }
+        if self._account_kind(account_num) == "gateway":
+            active.update(
+                kind="gateway",
+                usageStatus="gateway",
+                gateway=gateway.json_fields(
+                    data["accounts"][account_num], entry.gateway
+                ),
+            )
         if alias:
             active["alias"] = alias
         if usage is not None:
@@ -5946,7 +6072,12 @@ class ClaudeAccountSwitcher:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
 
         if account_num:
-            tag = self._get_display_tag(current_email, org_name, current_org_uuid)
+            record = data["accounts"][account_num]
+            tag = (
+                gateway.tag(record)
+                if record.get("kind") == "gateway"
+                else self._get_display_tag(current_email, org_name, current_org_uuid)
+            )
             total = len(data.get("accounts", {}))
             print(
                 f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
@@ -6505,7 +6636,12 @@ class ClaudeAccountSwitcher:
             identity = self._get_current_account()
             if identity is not None:
                 cur_slot = self._find_account_slot(data, identity[0], identity[1])
-                if cur_slot == target_account:
+                if (
+                    cur_slot == target_account
+                    and self._account_kind(target_account) == "gateway"
+                ):
+                    action = "noop"
+                elif cur_slot == target_account:
                     action, provenance = self._self_switch_action(
                         target_account, identity[0]
                     )
@@ -6917,6 +7053,78 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _gateway_settings_path(self) -> Path:
+        from claude_swap.paths import get_claude_config_home
+
+        return get_claude_config_home() / "settings.json"
+
+    @contextmanager
+    def _gateway_settings_transaction(self, target: str):
+        """Runs inside all three switch locks; undo the exact prior settings."""
+        data = self._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        target_record = accounts.get(target, {})
+        path = self._gateway_settings_path()
+        source = gateway.active_slot(path, accounts)
+        is_gateway = target_record.get("kind") == "gateway"
+        if source is None and not is_gateway:
+            yield None
+            return
+        identity = self._get_current_account()
+        source_num = self._find_account_slot(data, *identity) if identity else None
+        from_ref = (
+            account_ref(int(source_num) if source_num else None, identity[0])
+            if identity
+            else None
+        )
+        if is_gateway:
+            self._read_target_credentials(target, target_record["email"])
+        parsed = gateway.read_settings(path)
+        if (
+            parsed.get("apiKeyHelper") is not None
+            and gateway.owned_slot(parsed["apiKeyHelper"]) is None
+        ):
+            raise SwitchError(
+                "Claude settings.json has a foreign apiKeyHelper; refusing to replace it"
+            )
+        previous = path.read_bytes() if path.exists() else None
+        sequence_before = self.sequence_file.read_bytes()
+        transaction = SwitchTransaction(
+            "",
+            "",
+            source or "",
+            "",
+            self._get_claude_config_path(),
+            settings_path=path,
+            original_settings=previous,
+        )
+        transaction.record_step("settings_written")
+        try:
+            gateway.write_settings(path, target if is_gateway else None, target_record)
+            yield {"from": from_ref}
+        except Exception:
+            restored = transaction.rollback(self)
+            try:
+                atomic_write_bytes(self.sequence_file, sequence_before)
+            except Exception:
+                restored = False
+            if not restored:
+                raise SwitchError(
+                    "Gateway switch failed and rollback was incomplete; "
+                    "check Claude settings and the active account before retrying"
+                ) from None
+            raise SwitchError(
+                "Gateway switch failed; previous settings restored"
+            ) from None
+
+    def gateway_credential(self, slot: str) -> str | None:
+        """The hidden helper has exactly one authorized credential source."""
+        with FileLock(self.lock_file):
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            if gateway.active_slot(self._gateway_settings_path(), accounts) != slot:
+                return None
+            return self._read_account_credentials(slot, accounts[slot]["email"]) or None
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6958,7 +7166,7 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
-        if pre_email:
+        if pre_email and pre_account.get("kind") != "gateway":
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
                 self._session_dir(target_account, pre_email)
@@ -7029,6 +7237,11 @@ class ClaudeAccountSwitcher:
             provenance = (
                 {"live": None, "resolved": None}
                 if force_activate
+                or pre_account.get("kind") == "gateway"
+                or gateway.active_slot(
+                    self._gateway_settings_path(), pre_data.get("accounts", {})
+                )
+                is not None
                 else self._prefetch_live_identity()
             )
 
@@ -7040,8 +7253,27 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+            self._gateway_settings_transaction(target_account) as gateway_switch,
+        ):
             data = self._get_sequence_data()
+            if data["accounts"][target_account].get("kind") == "gateway":
+                data["activeAccountNumber"] = int(target_account)
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+                target_email = data["accounts"][target_account]["email"]
+                if emit_output:
+                    print(
+                        f"{accent('Switched to')} Account-{target_account} ({target_email})"
+                    )
+                return {
+                    "from": gateway_switch["from"],
+                    "to": account_ref(int(target_account), target_email),
+                    "warnings": warnings_out,
+                }
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
@@ -7247,7 +7479,11 @@ class ClaudeAccountSwitcher:
                     target_email,
                     data["accounts"][target_account].get("organizationUuid", ""),
                 )
-                return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+                return {
+                    "from": gateway_switch["from"] if gateway_switch else from_ref,
+                    "to": to_ref,
+                    "warnings": warnings_out,
+                }
 
             current_email, _ = current_identity
             from_ref = account_ref(int(current_account), current_email)
@@ -7513,7 +7749,11 @@ class ClaudeAccountSwitcher:
             target_email,
             data["accounts"][target_account].get("organizationUuid", ""),
         )
-        return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+        return {
+            "from": gateway_switch["from"] if gateway_switch else from_ref,
+            "to": to_ref,
+            "warnings": warnings_out,
+        }
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
