@@ -6840,10 +6840,16 @@ class ClaudeAccountSwitcher:
         result["live"] = live
         if not live:
             return result
-        identity = self._get_current_account()
+        data = self._get_sequence_data() or {}
+        if gateway.active_slot(self._gateway_settings_path(), data.get("accounts", {})) is not None:
+            # Gateway settings mask the retained OAuth login. Its live bytes
+            # still need attribution before they can be overwritten on return.
+            triple = self._get_current_identity_triple()
+            identity = None if triple is None else triple[:2]
+        else:
+            identity = self._get_current_account()
         if identity is None:
             return result
-        data = self._get_sequence_data() or {}
         slot = self._find_account_slot(data, identity[0], identity[1])
         if slot is None:
             return result
@@ -7508,10 +7514,6 @@ class ClaudeAccountSwitcher:
             provenance = (
                 {"live": None, "resolved": None}
                 if force_activate
-                or gateway.active_slot(
-                    self._gateway_settings_path(), pre_data.get("accounts", {})
-                )
-                is not None
                 else self._prefetch_live_identity()
             )
 

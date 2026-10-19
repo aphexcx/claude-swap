@@ -353,3 +353,22 @@ def test_gateway_entry_can_recover_without_live_oauth_credentials(gateway_switch
     assert s.current_account_number() == "2"
     assert s.gateway_credential("2") == KEY
     assert s.read_account_credentials("1", s.account_email("1")) == backup
+
+
+@pytest.mark.parametrize("live_expiry", [1000, 3000])
+def test_gateway_return_resolves_foreign_live_owner_without_cached_verdict(gateway_switcher, monkeypatch, live_expiry):
+    from claude_swap import oauth
+    s = gateway_switcher
+    seed_oauth(s)
+    email = s.account_email("1")
+    backup = json.dumps({"claudeAiOauth": {"accessToken": "own-access", "refreshToken": "own-refresh", "expiresAt": 2000}})
+    s._write_account_credentials("1", email, backup)
+    get_credentials_path().write_text(backup)
+    s.switch_to("2", json_output=True)
+    foreign = json.dumps({"claudeAiOauth": {"accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": live_expiry}})
+    get_credentials_path().write_text(foreign)
+    s._probe_verdicts.clear()
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *a: {"uuid": "foreign-uuid", "email": "foreign@example.com", "organizationUuid": "foreign-org"})
+    s.switch_to("1", json_output=True)
+    assert s.read_account_credentials("1", email) == backup
+    assert any(s._store._read_unclaimed_credential(n)[0] == foreign for n in s.list_unclaimed_credentials())
