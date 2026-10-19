@@ -35,6 +35,47 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("mode", ["no-candidates", "reset", "opt-out", "disabled", "quarantined"])
+    def test_blocked_loop_obeys_enabled_gateway_recovery_deadline(self, temp_home, monkeypatch, mode):
+        from dataclasses import replace
+        from tests.test_autoswitch import _iso_at
+
+        h = fleet(temp_home, monkeypatch)
+        if mode == "no-candidates":
+            h.switcher.remove_account("2", assume_yes=True)
+        monkeypatch.setattr(h.switcher, "_run_usage_fetches",
+                            lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(100, _iso_at(h.clock() + 10000))) for i in infos})
+        probes = []
+        def probe(record, key, **kwargs):
+            probes.append(h.clock())
+            return dict(probeStatus="cooling" if len(probes) == 1 else "ok",
+                        probedAt=h.clock(), retryAt=h.clock() + 60 if len(probes) == 1 else None,
+                        coolingSince=h.clock(), budget=None)
+        monkeypatch.setattr(gateway, "probe", probe)
+        h.switcher.usage_entries_by_account(fetch={"3"})
+        if mode == "opt-out":
+            h.engine.settings = replace(h.settings, include_gateway_accounts=False)
+        elif mode == "disabled":
+            h.switcher.set_account_disabled("3", True)
+        elif mode == "quarantined":
+            h.engine._quarantine("3", h.switcher.account_email("3"), "invalid_grant")
+        waits = []
+        def wait(delay):
+            waits.append(delay)
+            h.clock.advance(delay)
+            if mode in ("opt-out", "disabled", "quarantined") or h.active_number() == 3 or len(waits) > 3:
+                h.engine.stop()
+        monkeypatch.setattr(h.engine._wake, "wait", wait)
+        assert h.engine.run_loop() == 0
+        if mode in ("no-candidates", "reset"):
+            assert waits[0] == pytest.approx(60)
+            assert probes[1] - probes[0] == pytest.approx(60)
+            assert h.active_number() == 3
+        else:
+            assert waits[0] >= 300
+            assert len(probes) == 1
+            assert h.active_number() == 1
+
     @pytest.mark.parametrize("status,extra,enabled,target_state,second,expected", [
         ("exhausted", {}, True, "usable", 100, 4),
         ("unauthorized", {}, True, "usable", 100, 4),
