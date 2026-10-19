@@ -6808,6 +6808,8 @@ class ClaudeAccountSwitcher:
         original_creds: str,
         provenance: dict,
         data: dict,
+        *,
+        gateway_return: bool = False,
     ) -> tuple[str, str | None]:
         """Decide what the switch-time backup may do with the live credential.
 
@@ -6815,6 +6817,8 @@ class ClaudeAccountSwitcher:
 
         - ``"own-bytes"``      — byte-identical to the slot's stored backup;
           nothing changed, nothing to capture.
+        - ``"stored-newer"``   — returning from a gateway with a backup
+          newer than the idle live OAuth credential; keep the backup.
         - ``"own-family"``     — same refresh-token lineage (access token
           rotated); back up normally.
         - ``"own-rotated"``    — full rotation, but the profile endpoint
@@ -6861,6 +6865,20 @@ class ClaudeAccountSwitcher:
           the extra safety.
         """
         backup = self._read_account_credentials(current_account, current_email)
+        if gateway_return and backup:
+            # Polling can rotate the OAuth backup while the gateway leaves
+            # the live login untouched. Identity alone cannot distinguish
+            # those generations: never copy the older live token back.
+            stored = oauth.extract_oauth_data(backup) or {}
+            live = oauth.extract_oauth_data(original_creds) or {}
+            try:
+                stored_newer = float(stored.get("expiresAt") or 0) > float(
+                    live.get("expiresAt") or 0
+                )
+            except (TypeError, ValueError):
+                stored_newer = False
+            if stored_newer and stored.get("accessToken"):
+                return ("stored-newer", None)
         if backup and backup == original_creds:
             return ("own-bytes", None)
         if backup and (
@@ -7536,6 +7554,7 @@ class ClaudeAccountSwitcher:
                 kind, foreign_slot = self._classify_outgoing_credential(
                     current_account, current_email, original_creds,
                     provenance, data,
+                    gateway_return=gateway_switch is not None,
                 )
                 if kind in ("foreign", "alien", "known-foreign"):
                     # Positively not this slot's bytes: never into a slot;
@@ -7632,18 +7651,19 @@ class ClaudeAccountSwitcher:
                         "differs from the stored backup and ownership could "
                         "not be verified — pre-fix backup)"
                     )
-                elif kind == "own-bytes":
+                elif kind in ("own-bytes", "stored-newer"):
                     # Untouched since cswap wrote it — the slot already holds
                     # these bytes. Refresh only the config backup. (Rare since
                     # #145: activation composes live shared MCP state into the
                     # written credential, so live bytes match the slot's only
-                    # when nothing was composed in.)
+                    # when nothing was composed in.) Also keep a backup
+                    # refreshed while the gateway left this live copy idle.
                     self._write_account_config(
                         current_account, current_email, original_config
                     )
                     self._logger.info(
                         f"Backed up account {current_account} (config only; "
-                        "credentials unchanged)"
+                        "stored credentials kept)"
                     )
                 else:  # own-family / own-rotated
                     self._write_account_credentials(
