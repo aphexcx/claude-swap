@@ -323,7 +323,7 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_
     original["claudeAiOauth"].update(accessToken="own-access", refreshToken="own-refresh", expiresAt=2000)
     backup = json.dumps(original)
     s._write_account_credentials("1", email, backup)
-    s.switch_to("1", force=True, json_output=True)
+    get_credentials_path().write_text(backup)
     s.switch_to("2", json_output=True)
     foreign = json.dumps({"claudeAiOauth": {
         "accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": 1000,
@@ -337,4 +337,4 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_
     assert len(stash) == 1
     entry_id, metadata = next(iter(stash.items()))
     assert metadata["reason"] == "known-foreign"
-    assert s._store._read_unclaimed_credential(entry_id) == foreign
+    assert s._store._read_unclaimed_credential(entry_id) == (foreign, False)
