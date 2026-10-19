@@ -878,7 +878,9 @@ class ClaudeAccountSwitcher:
         """Pre-commit clear that raises when the key still reads non-empty."""
         self._store.delete_account_credentials_strict(account_num, email)
 
-    def _delete_account_files(self, account_num: str, email: str) -> None:
+    def _delete_account_files(
+        self, account_num: str, email: str, *, before_delete=None
+    ) -> None:
         """Delete all backup files for an account (credentials + config).
 
         Single chokepoint for every path that removes or displaces a slot
@@ -891,6 +893,8 @@ class ClaudeAccountSwitcher:
             SessionError: a live session-mode instance is using this account.
         """
         self._ensure_no_live_session(account_num, email, "the operation")
+        if before_delete is not None:
+            before_delete()
         self._delete_account_credentials(account_num, email)
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
@@ -4098,6 +4102,7 @@ class ClaudeAccountSwitcher:
                 raise ConfigError(
                     f"Existing account metadata for {email} is inconsistent"
                 )
+            self._refuse_active_gateway_replacement(seq, account_num)
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
             # A refreshed credential invalidates any dead-token quarantine on this
@@ -4136,6 +4141,7 @@ class ClaudeAccountSwitcher:
                 if old_num and old_num != account_num:
                     migrate_from = old_num
 
+            self._refuse_active_gateway_replacement(data, account_num, migrate_from)
             if account_num in data.get("accounts", {}):
                 existing = data["accounts"][account_num]
                 existing_email = existing.get("email", "unknown")
@@ -4225,6 +4231,11 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+
+    def _refuse_active_gateway_replacement(self, data: dict, *slots: str | None) -> None:
+        active = gateway.active_slot(self._gateway_settings_path(), data.get("accounts", {}))
+        if active is not None and active in slots:
+            raise ConfigError("Switch away from the active gateway before replacing or moving its account")
 
     def remove_account(self, identifier: str, assume_yes: bool = False) -> None:
         """Remove account from managed accounts.
@@ -4317,11 +4328,17 @@ class ClaudeAccountSwitcher:
                     raise ConfigError(
                         "Switch away from the active gateway before removing it"
                     )
-                if not remaining:
-                    gateway.write_settings(path, None, remove_last=True)
-
-        # Remove backup files
-        self._delete_account_files(account_num, email)
+                # The delete chokepoint rechecks live sessions; a session
+                # may have started since the pre-prompt check. Refuse before
+                # changing even the leftover first-party settings value.
+                self._delete_account_files(
+                    account_num, email,
+                    before_delete=(
+                        lambda: gateway.write_settings(path, None, remove_last=True)
+                    ) if not remaining else None,
+                )
+        else:
+            self._delete_account_files(account_num, email)
 
         # Update sequence.json
         del data["accounts"][account_num]
@@ -7122,7 +7139,10 @@ class ClaudeAccountSwitcher:
         )
         if is_gateway:
             self._read_target_credentials(target, target_record["email"])
-        parsed = gateway.read_settings(path)
+        try:
+            parsed = gateway.read_settings(path)
+        except ValueError as exc:
+            raise SwitchError(str(exc)) from None
         if (
             parsed.get("apiKeyHelper") is not None
             and gateway.owned_slot(parsed["apiKeyHelper"]) is None

@@ -7,7 +7,7 @@ import pytest
 
 from claude_swap import gateway
 from claude_swap import cli
-from claude_swap.exceptions import ConfigError, SwitchError, ValidationError
+from claude_swap.exceptions import ConfigError, SessionError, SwitchError, ValidationError
 from claude_swap.paths import get_credentials_path, get_global_config_path
 from tests.test_gateway_accounts import KEY
 from tests.test_gateway_accounts import gateway_switcher as gateway_switcher
@@ -20,6 +20,48 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("contents", ["{broken", '{"env": []}'])
+    def test_malformed_gateway_settings_raises_switch_error(self, gateway_switcher, contents):
+        s = gateway_switcher
+        seed_oauth(s)
+        s._gateway_settings_path().write_text(contents)
+        with pytest.raises(SwitchError, match="Cannot read Claude settings.json"):
+            s.switch_to("2", json_output=True)
+        assert s._gateway_settings_path().read_text() == contents
+
+    @pytest.mark.parametrize("slot,email", [(2, None), (None, "gateway-2@token.local"), (4, "gateway-2@token.local"), (2, "other@example.com")])
+    def test_active_gateway_add_token_overwrite_or_migration_refused(self, gateway_switcher, slot, email):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        sequence = s.sequence_file.read_bytes()
+        settings = s._gateway_settings_path().read_bytes()
+        with pytest.raises(ConfigError, match="Switch away from the active gateway"):
+            s.add_account_from_token(KEY, base_url="https://other.example", slot=slot, email=email, assume_yes=True)
+        assert s.sequence_file.read_bytes() == sequence
+        assert s._gateway_settings_path().read_bytes() == settings
+        assert s.gateway_credential("2") == KEY
+
+    def test_remove_gateway_live_session_refusal_keeps_settings(self, gateway_switcher, monkeypatch):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        s.switch_to("1", json_output=True)
+        settings = s._gateway_settings_path().read_bytes()
+        sequence = s.sequence_file.read_bytes()
+        calls = []
+
+        def refuse_at_delete(*args):
+            calls.append(args)
+            if len(calls) > 1:
+                raise SessionError("live session appeared")
+
+        monkeypatch.setattr(s, "_ensure_no_live_session", refuse_at_delete)
+        with pytest.raises(SessionError, match="live session appeared"):
+            s.remove_account("2", assume_yes=True)
+        assert s._gateway_settings_path().read_bytes() == settings
+        assert s.sequence_file.read_bytes() == sequence
+
     def test_purge_refuses_active_gateway(self, gateway_switcher, monkeypatch):
         s = gateway_switcher
         seed_oauth(s)
@@ -40,8 +82,8 @@ class TestGatewayActivation:
         email = s._get_sequence_data()["accounts"]["1"]["email"]
         profile = s._session_dir("1", email)
         profile.mkdir(parents=True)
-        # Simulate an older session profile still linked to default settings.
-        (profile / "settings.json").symlink_to(s._gateway_settings_path())
+        # Simulate an older session profile with inherited gateway settings.
+        (profile / "settings.json").write_bytes(s._gateway_settings_path().read_bytes())
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
         monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda: s)
         monkeypatch.setattr(sys, "argv", ["cswap", "gateway-credential", "2"])

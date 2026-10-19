@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from claude_swap import gateway
-from claude_swap.autoswitch import AutoSwitchEngine, ConfigWarningEvent, SwitchEvent, TickOutcome
+from claude_swap.autoswitch import AutoSwitchEngine, ConfigWarningEvent, NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from tests.test_autoswitch import EngineHarness, _entry_for, _usage
 from tests.test_gateway_accounts import KEY
@@ -35,6 +35,12 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_gateway_hold_inside_hysteresis_is_not_all_exhausted(self, temp_home, monkeypatch):
+        h = fleet(temp_home, monkeypatch)
+        h.switcher.switch_to("3", json_output=True)
+        assert h.tick_with_entries(readings(h, second=85)) == TickOutcome.NO_ACTION
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["gateway-hold"]
+
     def test_persistent_transient_gateway_leaves_for_oauth_inside_band(self, temp_home, monkeypatch):
         h = fleet(temp_home, monkeypatch)
         h.switcher.switch_to("3", json_output=True)
