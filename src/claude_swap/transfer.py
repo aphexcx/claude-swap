@@ -197,53 +197,53 @@ def export_accounts(
     else:
         target_nums = sorted(accounts_map.keys(), key=int)
 
-    # Identify the live active account (live vault has fresher tokens than backup)
-    current_identity = switcher._get_current_account()
-
     accounts_payload: list[dict[str, Any]] = []
     for num in target_nums:
-        record = accounts_map[num]
-        email = record.get("email", "")
-        org_uuid = record.get("organizationUuid", "") or ""
-        record, gateway_key = switcher.account_auth_snapshot(num, email, org_uuid)
+        # Snapshot every kind together: a concurrent import may replace an
+        # OAuth/API-key record with a gateway as well as rotate a gateway key.
+        with FileLock(switcher.lock_file):
+            expected = accounts_map[num]
+            record = (switcher._get_sequence_data() or {}).get("accounts", {}).get(num)
+            if record is None or any(record.get(k) != expected.get(k) for k in ("email", "organizationUuid", "uuid")):
+                raise TransferError("Account changed while preparing export; retry")
+            email = record.get("email", "")
+            org_uuid = record.get("organizationUuid", "") or ""
+            current_identity = switcher._get_current_account()
 
-        is_active = (
-            current_identity is not None
-            and current_identity[0] == email
-            and current_identity[1] == org_uuid
-        )
-
-        if is_active and record.get("kind") != "gateway":
-            creds_text = switcher._read_credentials()
-            if not creds_text:
-                raise CredentialReadError(
-                    f"failed to read live credentials for active account {email}"
-                )
-            config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
-                raise ConfigError("Claude config file not found")
-            config_text = config_path.read_text(encoding="utf-8")
-        else:
-            creds_text = (
-                gateway_key if record.get("kind") == "gateway"
-                else switcher._read_account_credentials(num, email)
+            is_active = (
+                current_identity is not None
+                and current_identity[0] == email
+                and current_identity[1] == org_uuid
             )
-            config_text = switcher._read_account_config(num, email)
-            if not creds_text or not config_text:
-                if explicit_account:
-                    if not creds_text:
-                        raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
-                        )
-                    raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+
+            if is_active and record.get("kind") != "gateway":
+                creds_text = switcher._read_credentials()
+                if not creds_text:
+                    raise CredentialReadError(
+                        f"failed to read live credentials for active account {email}"
                     )
-                _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
-                    f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
-                )
-                continue
+                config_path = switcher._get_claude_config_path()
+                if not config_path.exists():
+                    raise ConfigError("Claude config file not found")
+                config_text = config_path.read_text(encoding="utf-8")
+            else:
+                creds_text = switcher._read_account_credentials(num, email)
+                config_text = switcher._read_account_config(num, email)
+                if not creds_text or not config_text:
+                    if explicit_account:
+                        if not creds_text:
+                            raise CredentialReadError(
+                                f"no backup credentials found for account {num} ({email})"
+                            )
+                        raise ConfigError(
+                            f"no backup config found for account {num} ({email})"
+                        )
+                    _eprint(
+                        f"Skipping Account-{num} ({email}): no stored "
+                        f"credentials/config — re-add with: "
+                        f"cswap --add-account --slot {num}"
+                    )
+                    continue
 
         config_obj = _parse_payload(config_text, f"config for {email}")
         if not full:
