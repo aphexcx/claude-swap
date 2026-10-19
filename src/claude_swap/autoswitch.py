@@ -1790,6 +1790,11 @@ class AutoSwitchEngine:
             thresholds=thresholds,
         )
         trigger = failure
+        if settings.include_api_key_accounts:
+            ordered += [
+                n for n in candidates
+                if self.switcher.account_kind_for(n) == "api_key"
+            ]
         if settings.include_gateway_accounts:
             ordered += [
                 n
@@ -1824,7 +1829,7 @@ class AutoSwitchEngine:
         self._emit(
             NoSwitchEvent(
                 reason=failure or "gateway-hold",
-                detail="no eligible OAuth account; holding gateway",
+                detail="no eligible fallback account; holding gateway",
             )
         )
         oauth_peers = [
