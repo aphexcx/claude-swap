@@ -7005,6 +7005,150 @@ class ClaudeAccountSwitcher:
             return ("foreign-synced", slot)
         return ("foreign", slot)
 
+    def _backup_outgoing_credential(
+        self, current_account, current_email, original_creds, original_config,
+        provenance, data, emit_output, warnings_out, *, gateway_return=False,
+    ):
+        """Preserve the outgoing generation with the same ownership rules on every switch."""
+        # Step 1: Backup current account. Position in ~/.claude.json
+        # says which slot is active; only the classification says who
+        # owns the live bytes (issue #117: an external write here
+        # used to destroy the outgoing slot's refresh token). The
+        # identity oracle is strictly advisory — "unresolved" falls
+        # back to the exact pre-fix backup, so endpoint state never
+        # decides whether a switch completes.
+        kind, foreign_slot = self._classify_outgoing_credential(
+            current_account, current_email, original_creds,
+            provenance, data,
+            gateway_return=gateway_return,
+        )
+        if kind in ("foreign", "alien", "known-foreign"):
+            # Positively not this slot's bytes: never into a slot;
+            # never silently destroyed. The safety copy (which raises
+            # on failure, aborting before the live store is
+            # overwritten) is the license to proceed.
+            self._stash_live_credential(
+                original_creds, kind, current_account,
+                provenance.get("resolved"),
+            )
+            if kind == "foreign":
+                msg = (
+                    "Credential ownership mismatch detected. The live "
+                    "credential was preserved and was not written "
+                    f"into Account-{current_account}. If Account-"
+                    f"{foreign_slot} later cannot authenticate, log "
+                    "in as it and run: cswap add --slot "
+                    f"{foreign_slot}"
+                )
+            elif kind == "known-foreign":
+                msg = (
+                    "The live credential was previously identified "
+                    "as another account's. It was preserved and not "
+                    f"written into Account-{current_account}. If the "
+                    "owning account later cannot authenticate, log "
+                    "in as it and run: cswap add"
+                )
+            else:
+                msg = (
+                    "The live login does not match a managed "
+                    "account. It was preserved and not written into "
+                    f"Account-{current_account}. If you need that "
+                    "account, log in as it and run: cswap add"
+                )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "foreign-synced":
+            # Another managed account's bytes, and that slot already
+            # holds this lineage — nothing needs preserving, nothing
+            # may be written.
+            msg = (
+                "Credential ownership mismatch detected. The live "
+                f"credential already matches Account-{foreign_slot}'s "
+                "stored backup, so nothing was written into "
+                f"Account-{current_account}."
+            )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "wiped":
+            # Claude Code emptied the live token fields in place
+            # (its invalid_grant reaction). The blob carries nothing
+            # to preserve and writing it would replace the slot's
+            # only surviving refresh token with empty strings — the
+            # exact destruction chain observed in the field. Config
+            # backup only; the slot's credential backup is the
+            # recovery path.
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            msg = (
+                "The live credential's tokens were wiped (Claude "
+                "Code clears them when a refresh is rejected). "
+                f"Account-{current_account}'s stored backup was "
+                "kept. If the account cannot authenticate after "
+                "switching back, log in with Claude Code and run: "
+                "cswap add"
+            )
+            if emit_output:
+                warning(msg)
+            else:
+                warnings_out.append(msg)
+        elif kind == "unresolved":
+            # Ownership could not be established (offline, endpoint
+            # failure, malformed response, non-OAuth blob). Fail
+            # open: exact pre-fix backup. Most such divergences are
+            # the account's own rotation — skipping the backup would
+            # leave the slot holding a consumed token — and the
+            # .prev retention inside the write gives even a wrong
+            # call a best-effort recovery cushion. Log only:
+            # indistinguishable from a legitimate rotation, so a
+            # warning would cry wolf.
+            self._write_account_credentials(
+                current_account, current_email, original_creds
+            )
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            self._logger.info(
+                f"Backed up account {current_account} (lineage "
+                "differs from the stored backup and ownership could "
+                "not be verified — pre-fix backup)"
+            )
+        elif kind in ("own-bytes", "stored-newer"):
+            # Untouched since cswap wrote it — the slot already holds
+            # these bytes. Refresh only the config backup. (Rare since
+            # #145: activation composes live shared MCP state into the
+            # written credential, so live bytes match the slot's only
+            # when nothing was composed in.) Also keep a backup
+            # refreshed while the gateway left this live copy idle.
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            self._logger.info(
+                f"Backed up account {current_account} (config only; "
+                "stored credentials kept)"
+            )
+        else:  # own-family / own-rotated
+            self._write_account_credentials(
+                current_account, current_email, original_creds
+            )
+            self._write_account_config(
+                current_account, current_email, original_config
+            )
+            if kind == "own-rotated":
+                # The profile call proved the identity; backfill a
+                # missing slot uuid (add-token placeholder) while the
+                # sequence file is being rewritten anyway.
+                resolved = provenance.get("resolved") or {}
+                acct = data.get("accounts", {}).get(current_account, {})
+                if not acct.get("uuid") and resolved.get("uuid"):
+                    acct["uuid"] = resolved["uuid"]
+            self._logger.info(f"Backed up account {current_account}")
+
+
     def _stash_live_credential(
         self,
         original_creds: str,
@@ -7125,7 +7269,9 @@ class ClaudeAccountSwitcher:
         return get_claude_config_home() / "settings.json"
 
     @contextmanager
-    def _gateway_settings_transaction(self, target: str):
+    def _gateway_settings_transaction(
+        self, target: str, *, provenance: dict, emit_output: bool, warnings_out: list,
+    ):
         """Runs inside all three switch locks; undo the exact prior settings."""
         data = self._get_sequence_data() or {}
         accounts = data.get("accounts", {})
@@ -7170,6 +7316,15 @@ class ClaudeAccountSwitcher:
         transaction.record_step("settings_written")
         try:
             if is_gateway:
+                if source is None and source_num is not None and accounts[source_num].get("kind", "oauth") == "oauth":
+                    live = self._read_credentials()
+                    if not live:
+                        raise CredentialReadError("Current account credential is empty; refusing to overwrite its backup")
+                    self._backup_outgoing_credential(
+                        source_num, identity[0], live,
+                        self._get_claude_config_path().read_text(encoding="utf-8"),
+                        provenance, data, emit_output, warnings_out,
+                    )
                 # Existing OAuth sessions may still share settings via a
                 # symlink from before any gateway was added. Detach their
                 # auth settings before changing the default login, including
@@ -7183,7 +7338,7 @@ class ClaudeAccountSwitcher:
                         gateway_session=record.get("kind") == "gateway",
                     )
             gateway.write_settings(path, target if is_gateway else None, target_record)
-            yield {"from": from_ref}
+            yield {"from": from_ref, "data": data}
         except Exception:
             restored = transaction.rollback(self)
             try:
@@ -7320,7 +7475,6 @@ class ClaudeAccountSwitcher:
             provenance = (
                 {"live": None, "resolved": None}
                 if force_activate
-                or pre_account.get("kind") == "gateway"
                 or gateway.active_slot(
                     self._gateway_settings_path(), pre_data.get("accounts", {})
                 )
@@ -7340,10 +7494,14 @@ class ClaudeAccountSwitcher:
             FileLock(self.lock_file),
             claude_credentials_lock(),
             claude_config_lock(),
-            self._gateway_settings_transaction(target_account) as gateway_switch,
+            self._gateway_settings_transaction(
+                target_account, provenance=provenance,
+                emit_output=emit_output, warnings_out=warnings_out,
+            ) as gateway_switch,
         ):
             data = self._get_sequence_data()
             if data["accounts"][target_account].get("kind") == "gateway":
+                data = gateway_switch["data"]
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
@@ -7601,143 +7759,11 @@ class ClaudeAccountSwitcher:
             )
 
             try:
-                # Step 1: Backup current account. Position in ~/.claude.json
-                # says which slot is active; only the classification says who
-                # owns the live bytes (issue #117: an external write here
-                # used to destroy the outgoing slot's refresh token). The
-                # identity oracle is strictly advisory — "unresolved" falls
-                # back to the exact pre-fix backup, so endpoint state never
-                # decides whether a switch completes.
-                kind, foreign_slot = self._classify_outgoing_credential(
-                    current_account, current_email, original_creds,
-                    provenance, data,
+                self._backup_outgoing_credential(
+                    current_account, current_email, original_creds, original_config,
+                    provenance, data, emit_output, warnings_out,
                     gateway_return=gateway_switch is not None,
                 )
-                if kind in ("foreign", "alien", "known-foreign"):
-                    # Positively not this slot's bytes: never into a slot;
-                    # never silently destroyed. The safety copy (which raises
-                    # on failure, aborting before the live store is
-                    # overwritten) is the license to proceed.
-                    self._stash_live_credential(
-                        original_creds, kind, current_account,
-                        provenance.get("resolved"),
-                    )
-                    if kind == "foreign":
-                        msg = (
-                            "Credential ownership mismatch detected. The live "
-                            "credential was preserved and was not written "
-                            f"into Account-{current_account}. If Account-"
-                            f"{foreign_slot} later cannot authenticate, log "
-                            "in as it and run: cswap add --slot "
-                            f"{foreign_slot}"
-                        )
-                    elif kind == "known-foreign":
-                        msg = (
-                            "The live credential was previously identified "
-                            "as another account's. It was preserved and not "
-                            f"written into Account-{current_account}. If the "
-                            "owning account later cannot authenticate, log "
-                            "in as it and run: cswap add"
-                        )
-                    else:
-                        msg = (
-                            "The live login does not match a managed "
-                            "account. It was preserved and not written into "
-                            f"Account-{current_account}. If you need that "
-                            "account, log in as it and run: cswap add"
-                        )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "foreign-synced":
-                    # Another managed account's bytes, and that slot already
-                    # holds this lineage — nothing needs preserving, nothing
-                    # may be written.
-                    msg = (
-                        "Credential ownership mismatch detected. The live "
-                        f"credential already matches Account-{foreign_slot}'s "
-                        "stored backup, so nothing was written into "
-                        f"Account-{current_account}."
-                    )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "wiped":
-                    # Claude Code emptied the live token fields in place
-                    # (its invalid_grant reaction). The blob carries nothing
-                    # to preserve and writing it would replace the slot's
-                    # only surviving refresh token with empty strings — the
-                    # exact destruction chain observed in the field. Config
-                    # backup only; the slot's credential backup is the
-                    # recovery path.
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    msg = (
-                        "The live credential's tokens were wiped (Claude "
-                        "Code clears them when a refresh is rejected). "
-                        f"Account-{current_account}'s stored backup was "
-                        "kept. If the account cannot authenticate after "
-                        "switching back, log in with Claude Code and run: "
-                        "cswap add"
-                    )
-                    if emit_output:
-                        warning(msg)
-                    else:
-                        warnings_out.append(msg)
-                elif kind == "unresolved":
-                    # Ownership could not be established (offline, endpoint
-                    # failure, malformed response, non-OAuth blob). Fail
-                    # open: exact pre-fix backup. Most such divergences are
-                    # the account's own rotation — skipping the backup would
-                    # leave the slot holding a consumed token — and the
-                    # .prev retention inside the write gives even a wrong
-                    # call a best-effort recovery cushion. Log only:
-                    # indistinguishable from a legitimate rotation, so a
-                    # warning would cry wolf.
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
-                    )
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    self._logger.info(
-                        f"Backed up account {current_account} (lineage "
-                        "differs from the stored backup and ownership could "
-                        "not be verified — pre-fix backup)"
-                    )
-                elif kind in ("own-bytes", "stored-newer"):
-                    # Untouched since cswap wrote it — the slot already holds
-                    # these bytes. Refresh only the config backup. (Rare since
-                    # #145: activation composes live shared MCP state into the
-                    # written credential, so live bytes match the slot's only
-                    # when nothing was composed in.) Also keep a backup
-                    # refreshed while the gateway left this live copy idle.
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    self._logger.info(
-                        f"Backed up account {current_account} (config only; "
-                        "stored credentials kept)"
-                    )
-                else:  # own-family / own-rotated
-                    self._write_account_credentials(
-                        current_account, current_email, original_creds
-                    )
-                    self._write_account_config(
-                        current_account, current_email, original_config
-                    )
-                    if kind == "own-rotated":
-                        # The profile call proved the identity; backfill a
-                        # missing slot uuid (add-token placeholder) while the
-                        # sequence file is being rewritten anyway.
-                        resolved = provenance.get("resolved") or {}
-                        acct = data.get("accounts", {}).get(current_account, {})
-                        if not acct.get("uuid") and resolved.get("uuid"):
-                            acct["uuid"] = resolved["uuid"]
-                    self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
                 target_creds = self._read_target_credentials(
