@@ -34,6 +34,10 @@ DEFAULT_RETRY_S = 3600
 JITTER_FRAC = 0.1
 TIMEOUT_S = 15
 RECORD_FIELDS = ("baseUrl", "auth", "usageUrl", "probeModel", "modelDiscovery")
+AUTH_OVERRIDE_ENV_VARS = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
+)
 
 
 def validate_url(value: str, *, base: bool = False) -> str:
@@ -180,6 +184,13 @@ def restore_settings(path: Path, previous: bytes | None) -> None:
         atomic_bytes(path, previous)
 
 
+def refuse_auth_overrides(settings: dict, path: Path) -> None:
+    if any(settings.get("env", {}).get(name) for name in AUTH_OVERRIDE_ENV_VARS):
+        raise ValueError(
+            f"Claude settings file {path} contains authentication overrides; remove them before activating a gateway"
+        )
+
+
 def write_settings(
     path: Path,
     slot: str | None,
@@ -205,6 +216,7 @@ def write_settings(
         )
     env = settings.setdefault("env", {})
     if slot is not None:
+        refuse_auth_overrides(settings, path)
         settings["apiKeyHelper"] = helper(slot)
         env["ANTHROPIC_BASE_URL"] = record["baseUrl"]
         if record.get("modelDiscovery"):
