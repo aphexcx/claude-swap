@@ -1467,7 +1467,8 @@ class TestRun:
         assert env["UNRELATED_VAR"] == "kept"
         profile = Path(env["CLAUDE_CONFIG_DIR"])
         assert not (profile / ".credentials.json").exists()
-        assert key not in (profile / "settings.json").read_text()
+        settings = profile / "settings.json"
+        assert not settings.exists() or key not in settings.read_text()
         out = capsys.readouterr().out
         assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
         assert key not in out
