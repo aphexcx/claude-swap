@@ -36,6 +36,48 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 class TestAutoswitchGateway:
     @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
+    @pytest.mark.parametrize("target_kind,origin", [("oauth", "oauth"), ("oauth", "gateway"), ("gateway", "oauth")])
+    def test_gateway_selection_rejects_replaced_target(self, temp_home, monkeypatch, phase, target_kind, origin):
+        import json
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        h = fleet(temp_home, monkeypatch, enabled=target_kind == "gateway")
+        s = h.switcher
+        target = "2" if target_kind == "oauth" else "3"
+        if origin == "gateway":
+            s.switch_to("3", json_output=True)
+        source = h.active_number()
+        path = temp_home / "target-replacement.json"
+        export_accounts(s, str(path), account=target)
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="gateway", credentials=KEY + "-replacement", baseUrl="https://replacement.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        replaced = []
+        def replace_target():
+            if not replaced:
+                replaced.append(True)
+                import_accounts(s, str(path), force=True)
+        if phase == "freshening":
+            prepare = h.engine._prepare_target
+            def race(*args):
+                replace_target()
+                return prepare(*args)
+            monkeypatch.setattr(h.engine, "_prepare_target", race)
+        else:
+            prefetch = s._prefetch_live_identity
+            def race():
+                replace_target()
+                return prefetch()
+            monkeypatch.setattr(s, "_prefetch_live_identity", race)
+        entries = readings(h, second=10 if target_kind == "oauth" else 100,
+                           status="exhausted" if origin == "gateway" else "ok")
+        assert h.tick_with_entries(entries) == TickOutcome.NO_ACTION
+        assert h.active_number() == source
+        assert s._read_account_credentials(target, s.account_email(target)) == KEY + "-replacement"
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert "lastSwitchAt" not in h.state()
+
+    @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
     @pytest.mark.parametrize("origin", ["gateway", "oauth"])
     def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase, origin):
         h = fleet(temp_home, monkeypatch)

@@ -16,6 +16,30 @@ from claude_swap.transfer import export_accounts, import_accounts
 KEY = "gateway-test-secret-DO-NOT-LEAK-9x7"
 
 
+def test_gateway_auth_generation_follows_explicit_writes_and_relocations(gateway_switcher, temp_home):
+    s = gateway_switcher
+    for num in (1, 2):
+        s.add_account_from_token("sk-ant-oat01-" + str(num), email=f"{num}@example.com", slot=num)
+    before = {n: r["authGeneration"] for n, r in s._get_sequence_data()["accounts"].items()}
+    path = temp_home / "batch.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    assert all("authGeneration" not in r for r in envelope["accounts"])
+    for row in envelope["accounts"]:
+        row["authGeneration"] = "caller-supplied"
+    path.write_text(json.dumps(envelope))
+    import_accounts(s, str(path), force=True)
+    after = {n: r["authGeneration"] for n, r in s._get_sequence_data()["accounts"].items()}
+    assert all(after[n] not in (before[n], "caller-supplied") for n in before)
+    s._write_account_credentials("1", s.account_email("1"), "automatic-descendant")
+    assert s._get_sequence_data()["accounts"]["1"]["authGeneration"] == after["1"]
+    s.swap_accounts("1", "2")
+    s.move_account("2", "5")
+    rows = s._get_sequence_data()["accounts"]
+    assert rows["1"]["authGeneration"] == after["2"]
+    assert rows["5"]["authGeneration"] == after["1"]
+
+
 @pytest.fixture
 def gateway_switcher(temp_home, monkeypatch):
     monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")

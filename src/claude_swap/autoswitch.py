@@ -1182,6 +1182,7 @@ class AutoSwitchEngine:
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
+        target_snapshots = self.switcher.switch_target_snapshots()
         if self.switcher.account_kind_for(current) == "gateway":
             # A previous OAuth idle hold must not suppress candidate polls
             # for the gateway, whose own probe now controls departure.
@@ -1243,6 +1244,7 @@ class AutoSwitchEngine:
                 settings,
                 state,
                 quarantined,
+                target_snapshots,
             )
 
         active_headroom = headroom.get(current)
@@ -1660,7 +1662,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot, expected_source=current)
+                return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {})
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant"):
                 continue
@@ -1683,7 +1685,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, expected_source=current)
+            return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {})
 
         if systemic or transient_failure:
             self._emit(
@@ -1735,6 +1737,7 @@ class AutoSwitchEngine:
         settings,
         state,
         quarantined,
+        target_snapshots,
     ):
         from claude_swap import gateway
 
@@ -1807,7 +1810,7 @@ class AutoSwitchEngine:
         for num in ordered:
             email = self.switcher.account_email(num)
             if self.dry_run:
-                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current)
+                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {})
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant", "skip-live-session"):
                 continue
@@ -1818,7 +1821,7 @@ class AutoSwitchEngine:
                 if not systemic or _SYSTEMIC_STATUSES.index(status) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current)
+            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {})
         if systemic or transient_failure:
             self._emit(ErrorEvent(
                 message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
@@ -2703,6 +2706,7 @@ class AutoSwitchEngine:
         trigger: str,
         left: tuple[float | None, float],
         *, expected_source: str | None = None,
+        expected_target: dict | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2735,6 +2739,8 @@ class AutoSwitchEngine:
 
             try:
                 source_args = {"expected_source": expected_source} if expected_source is not None else {}
+                if expected_target is not None:
+                    source_args["expected_target"] = expected_target
                 result = self.switcher.switch_to(number, json_output=True, **source_args)
             except StaleSwitchError:
                 self._emit(NoSwitchEvent(reason="active-account-changed"))

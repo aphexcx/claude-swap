@@ -626,6 +626,8 @@ def _import_accounts_locked(switcher, envelope, normalized, force):
             data["lastUpdated"] = get_timestamp()
             switcher._write_json(switcher.sequence_file, data)
 
+        # Carry locally published generations into the next batch write.
+        data = switcher._get_sequence_data()
         if is_envelope_active:
             resolved_active_slot = target_num
         written_slots.add(target_num)
