@@ -3883,6 +3883,10 @@ class ClaudeAccountSwitcher:
                 self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
+                if seq["accounts"][account_num].get("kind", "oauth") != "oauth":
+                    raise ValidationError(
+                        "Cannot refresh a gateway or API-key account from an OAuth login; use a distinct slot"
+                    )
                 with self._gateway_account_write([account_num], gateway_requested=False):
                     self._write_account_credentials(account_num, current_email, current_creds)
                     self._write_account_config(account_num, current_email, current_config)

@@ -20,6 +20,21 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_live_add_refuses_oauth_refresh_of_inactive_gateway(self, gateway_switcher, monkeypatch):
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s.account_email("1")
+        s.remove_account("1", assume_yes=True)
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=3, email=email)
+        monkeypatch.setattr(s, "_reject_foreign_credential_capture", lambda creds, *args: creds)
+        monkeypatch.setattr(s, "_reject_credential_drift_since_verify", lambda *args: None)
+        monkeypatch.setattr(s, "_reject_identity_drift_since_verify", lambda *args: None)
+        sequence = s.sequence_file.read_bytes()
+        with pytest.raises(ValidationError, match="gateway"):
+            s.add_account()
+        assert s.sequence_file.read_bytes() == sequence
+        assert s._read_account_credentials("3", email) == KEY
+
     def test_live_add_refuses_replacing_active_gateway(self, gateway_switcher):
         s = gateway_switcher
         seed_oauth(s)
