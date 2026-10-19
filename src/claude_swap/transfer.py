@@ -585,44 +585,45 @@ def _import_accounts_locked(switcher, envelope, normalized, force):
             switcher._refuse_active_gateway_replacement(data, target_num)
         except ConfigError as exc:
             raise ValidationError(str(exc)) from None
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
-        # Every successful import write introduces credential material whose
-        # previous auth verdict is no longer authoritative, so lift any
-        # dead-token quarantine on this slot (mirrors add_account / the
-        # add-token paths). This clears for both "imported" and "overwrote":
-        # account removal doesn't prune usage.json, so re-importing a removed
-        # identity into the same slot would otherwise stay quarantined and
-        # never re-fetch to prove the imported token — issue #138.
-        switcher._usage_store.clear_dead_token(
-            [target_num], {target_num: (entry["email"], entry["org_uuid"])}
-        )
+        with switcher._gateway_account_write([target_num], gateway_requested=entry["kind"] == "gateway"):
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
+            # Every successful import write introduces credential material whose
+            # previous auth verdict is no longer authoritative, so lift any
+            # dead-token quarantine on this slot (mirrors add_account / the
+            # add-token paths). This clears for both "imported" and "overwrote":
+            # account removal doesn't prune usage.json, so re-importing a removed
+            # identity into the same slot would otherwise stay quarantined and
+            # never re-fetch to prove the imported token — issue #138.
+            switcher._usage_store.clear_dead_token(
+                [target_num], {target_num: (entry["email"], entry["org_uuid"])}
+            )
 
-        data.setdefault("accounts", {})
-        data.setdefault("sequence", [])
-        new_record = {
-            "email": entry["email"],
-            "uuid": entry["uuid"],
-            "organizationUuid": entry["org_uuid"],
-            "organizationName": entry["org_name"],
-            "added": entry["added"],
-        }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
-        if entry["kind"] == "gateway":
-            new_record.update(entry["gateway_fields"])
-        if entry.get("alias"):
-            new_record["alias"] = entry["alias"]
-        data["accounts"][target_num] = new_record
-        if int(target_num) not in data["sequence"]:
-            data["sequence"].append(int(target_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, data)
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            new_record = {
+                "email": entry["email"],
+                "uuid": entry["uuid"],
+                "organizationUuid": entry["org_uuid"],
+                "organizationName": entry["org_name"],
+                "added": entry["added"],
+            }
+            if entry["kind"] == "api_key":
+                new_record["kind"] = "api_key"
+            if entry["kind"] == "gateway":
+                new_record.update(entry["gateway_fields"])
+            if entry.get("alias"):
+                new_record["alias"] = entry["alias"]
+            data["accounts"][target_num] = new_record
+            if int(target_num) not in data["sequence"]:
+                data["sequence"].append(int(target_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, data)
 
         if is_envelope_active:
             resolved_active_slot = target_num

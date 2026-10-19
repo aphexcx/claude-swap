@@ -18,6 +18,7 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     LockError,
@@ -811,7 +812,68 @@ class ClaudeAccountSwitcher:
             self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        if self._account_write_pending(account_num):
+            return ""
         return self._store._read_account_credentials(account_num, email)
+
+    def _account_write_marker(self, account_num: str) -> Path:
+        return self.backup_dir / f".account-write-{account_num}.pending"
+
+    def _account_write_pending(self, account_num: str) -> bool:
+        try:
+            self._account_write_marker(account_num).stat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # Uncertain marker state must never license a key.
+        return True
+
+    def _refuse_pending_account_write(self, account_num: str) -> None:
+        if self._account_write_pending(account_num):
+            raise ConfigError(
+                f"Account-{account_num} replacement is incomplete; retry add-token with --slot {account_num} or import before using it"
+            )
+
+    @contextmanager
+    def _gateway_account_write(self, slots, *, gateway_requested: bool = False):
+        """Fail closed across multi-file replacement; caller holds roster lock.
+
+        The marker carries no credential. Ordinary store writes retain their
+        previous generation, while all authentication readers refuse this slot
+        until every write commits. A failed or interrupted write can be retried.
+        """
+        slots = sorted({str(num) for num in slots if num is not None})
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        guarded = gateway_requested or any(
+            accounts.get(num, {}).get("kind") == "gateway" or self._account_write_pending(num)
+            for num in slots
+        )
+        if not guarded:
+            yield
+            return
+        try:
+            cleanup_slots = set(slots)
+            for num in slots:
+                try:
+                    prior = json.loads(self._account_write_marker(num).read_text())
+                except (FileNotFoundError, ValueError):
+                    continue
+                if isinstance(prior, dict):
+                    cleanup_slots.update(str(n) for n in prior.get("slots", []) if str(n).isdigit())
+            marker = json.dumps({"slots": sorted(cleanup_slots)}) + "\n"
+            for num in slots:
+                atomic_write_text(self._account_write_marker(num), marker)
+            yield
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            for num in cleanup_slots:
+                # A retry can finish a migration after its source row was
+                # already deleted. Never release another still-managed row.
+                if num in slots or num not in accounts:
+                    self._account_write_marker(num).unlink(missing_ok=True)
+        except (OSError, ClaudeSwitchError):
+            raise ConfigError(
+                "Account replacement is incomplete; retry add-token with the intended slot or import before using affected accounts"
+            ) from None
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -971,6 +1033,7 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(account_num)
         if not record:
             raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        self._refuse_pending_account_write(account_num)
         return (
             account_num,
             record.get("email", ""),
@@ -1100,6 +1163,7 @@ class ClaudeAccountSwitcher:
         aborts here rather than committing a swap/move that silently drops
         the slot's live refresh token in favor of an empty destination.
         """
+        self._refuse_pending_account_write(account_num)
         creds, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:
             raise ConfigError(
@@ -1534,6 +1598,8 @@ class ClaudeAccountSwitcher:
         # concurrent swap/move and end up moving the wrong account.
         with FileLock(self.lock_file):
             self._get_sequence_data_migrated(locked=True)
+
+            self._refuse_pending_account_write(target)
 
             num_src = self._resolve_account_identifier(account)
             if not num_src:
@@ -2875,6 +2941,8 @@ class ClaudeAccountSwitcher:
     def _read_account_credentials_ex(
         self, account_num: str, email: str
     ) -> tuple[str, bool]:
+        if self._account_write_pending(account_num):
+            return "", False
         return self._store._read_account_credentials_ex(account_num, email)
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
@@ -3815,18 +3883,19 @@ class ClaudeAccountSwitcher:
                 self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
-                self._write_account_credentials(account_num, current_email, current_creds)
-                self._write_account_config(account_num, current_email, current_config)
-                self._usage_store.clear_dead_token(
-                    [account_num], {account_num: (current_email, current_org_uuid)}
-                )
+                with self._gateway_account_write([account_num], gateway_requested=False):
+                    self._write_account_credentials(account_num, current_email, current_creds)
+                    self._write_account_config(account_num, current_email, current_config)
+                    self._usage_store.clear_dead_token(
+                        [account_num], {account_num: (current_email, current_org_uuid)}
+                    )
 
-                if alias is not None:
-                    seq["accounts"][account_num]["alias"] = alias
+                    if alias is not None:
+                        seq["accounts"][account_num]["alias"] = alias
 
-                seq["activeAccountNumber"] = int(account_num)
-                seq["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, seq)
+                    seq["activeAccountNumber"] = int(account_num)
+                    seq["lastUpdated"] = get_timestamp()
+                    self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3949,50 +4018,55 @@ class ClaudeAccountSwitcher:
             )
             # Now safe to perform destructive cleanup (new account data is in memory)
             if displace_slot:
-                d_num, d_email, d_org = displace_slot
-                self._delete_account_files(d_num, d_email)
-                data = self._get_sequence_data()
-                if int(d_num) in data["sequence"]:
-                    data["sequence"].remove(int(d_num))
-                del data["accounts"][d_num]
-                self._write_json(self.sequence_file, data)
-                self._prune_mappings(d_email, d_org)
-
+                self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")
             if migrate_from:
+                self._ensure_no_live_session(migrate_from, expected_records[migrate_from]["email"], "the operation")
+            with self._gateway_account_write([account_num, migrate_from], gateway_requested=False):
+                if displace_slot:
+                    d_num, d_email, d_org = displace_slot
+                    self._delete_account_files(d_num, d_email)
+                    data = self._get_sequence_data()
+                    if int(d_num) in data["sequence"]:
+                        data["sequence"].remove(int(d_num))
+                    del data["accounts"][d_num]
+                    self._write_json(self.sequence_file, data)
+                    self._prune_mappings(d_email, d_org)
+
+                if migrate_from:
+                    data = self._get_sequence_data()
+                    old_email = data["accounts"][migrate_from].get("email", "")
+                    self._delete_account_files(migrate_from, old_email)
+                    if int(migrate_from) in data["sequence"]:
+                        data["sequence"].remove(int(migrate_from))
+                    del data["accounts"][migrate_from]
+                    self._write_json(self.sequence_file, data)
+
+                # Store backups
+                self._write_account_credentials(account_num, current_email, current_creds)
+                self._write_account_config(account_num, current_email, current_config)
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (current_email, organization_uuid)}
+                )
+
+                # Update sequence.json
                 data = self._get_sequence_data()
-                old_email = data["accounts"][migrate_from].get("email", "")
-                self._delete_account_files(migrate_from, old_email)
-                if int(migrate_from) in data["sequence"]:
-                    data["sequence"].remove(int(migrate_from))
-                del data["accounts"][migrate_from]
+                data["accounts"][account_num] = {
+                    "email": current_email,
+                    "uuid": account_uuid,
+                    "organizationUuid": organization_uuid,
+                    "organizationName": organization_name,
+                    "added": get_timestamp(),
+                }
+                carried_alias = alias if alias is not None else existing_alias
+                if carried_alias:
+                    data["accounts"][account_num]["alias"] = carried_alias
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["activeAccountNumber"] = int(account_num)
+                data["lastUpdated"] = get_timestamp()
+
                 self._write_json(self.sequence_file, data)
-
-            # Store backups
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, organization_uuid)}
-            )
-
-            # Update sequence.json
-            data = self._get_sequence_data()
-            data["accounts"][account_num] = {
-                "email": current_email,
-                "uuid": account_uuid,
-                "organizationUuid": organization_uuid,
-                "organizationName": organization_name,
-                "added": get_timestamp(),
-            }
-            carried_alias = alias if alias is not None else existing_alias
-            if carried_alias:
-                data["accounts"][account_num]["alias"] = carried_alias
-            if int(account_num) not in data["sequence"]:
-                data["sequence"].append(int(account_num))
-                data["sequence"].sort()
-            data["activeAccountNumber"] = int(account_num)
-            data["lastUpdated"] = get_timestamp()
-
-            self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4136,20 +4210,21 @@ class ClaudeAccountSwitcher:
                 self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
-                self._write_account_credentials(account_num, email, credentials)
-                self._write_account_config(account_num, email, config)
-                # A refreshed credential invalidates any dead-token quarantine on this
-                # slot (mirrors ``add_account``); otherwise the stale strike row keeps
-                # the account stuck at "re-login needed" and it never fetches the new
-                # token. Token accounts are always personal, so org is "".
-                self._usage_store.clear_dead_token(
-                    [account_num], {account_num: (email, "")}
-                )
-                seq["lastUpdated"] = get_timestamp()
-                seq["accounts"][account_num].update(gateway_fields)
-                if alias:
-                    seq["accounts"][account_num]["alias"] = alias
-                self._write_json(self.sequence_file, seq)
+                with self._gateway_account_write([account_num], gateway_requested=bool(gateway_fields)):
+                    self._write_account_credentials(account_num, email, credentials)
+                    self._write_account_config(account_num, email, config)
+                    # A refreshed credential invalidates any dead-token quarantine on this
+                    # slot (mirrors ``add_account``); otherwise the stale strike row keeps
+                    # the account stuck at "re-login needed" and it never fetches the new
+                    # token. Token accounts are always personal, so org is "".
+                    self._usage_store.clear_dead_token(
+                        [account_num], {account_num: (email, "")}
+                    )
+                    seq["lastUpdated"] = get_timestamp()
+                    seq["accounts"][account_num].update(gateway_fields)
+                    if alias:
+                        seq["accounts"][account_num]["alias"] = alias
+                    self._write_json(self.sequence_file, seq)
             kind_label = (
                 "gateway" if gateway_fields else "API key" if is_api_key else "token"
             )
@@ -4218,52 +4293,57 @@ class ClaudeAccountSwitcher:
                 self._get_sequence_data() or {}, account_num, migrate_from
             )
             if displace_slot:
-                d_num, d_email, d_org = displace_slot
-                self._delete_account_files(d_num, d_email)
-                data = self._get_sequence_data()
-                if int(d_num) in data["sequence"]:
-                    data["sequence"].remove(int(d_num))
-                del data["accounts"][d_num]
-                self._write_json(self.sequence_file, data)
-                self._prune_mappings(d_email, d_org)
-
+                self._ensure_no_live_session(displace_slot[0], displace_slot[1], "the operation")
             if migrate_from:
+                self._ensure_no_live_session(migrate_from, expected_records[migrate_from]["email"], "the operation")
+            with self._gateway_account_write([account_num, migrate_from], gateway_requested=bool(gateway_fields)):
+                if displace_slot:
+                    d_num, d_email, d_org = displace_slot
+                    self._delete_account_files(d_num, d_email)
+                    data = self._get_sequence_data()
+                    if int(d_num) in data["sequence"]:
+                        data["sequence"].remove(int(d_num))
+                    del data["accounts"][d_num]
+                    self._write_json(self.sequence_file, data)
+                    self._prune_mappings(d_email, d_org)
+
+                if migrate_from:
+                    data = self._get_sequence_data()
+                    old_email = data["accounts"][migrate_from].get("email", "")
+                    self._delete_account_files(migrate_from, old_email)
+                    if int(migrate_from) in data["sequence"]:
+                        data["sequence"].remove(int(migrate_from))
+                    del data["accounts"][migrate_from]
+                    self._write_json(self.sequence_file, data)
+
+                self._write_account_credentials(account_num, email, credentials)
+                self._write_account_config(account_num, email, config)
+                # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+                # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (email, "")}
+                )
+
                 data = self._get_sequence_data()
-                old_email = data["accounts"][migrate_from].get("email", "")
-                self._delete_account_files(migrate_from, old_email)
-                if int(migrate_from) in data["sequence"]:
-                    data["sequence"].remove(int(migrate_from))
-                del data["accounts"][migrate_from]
+                record = {
+                    "email": email,
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": get_timestamp(),
+                }
+                if is_api_key:
+                    record["kind"] = "api_key"
+                record.update(gateway_fields)
+                if alias:
+                    record["alias"] = alias
+                data["accounts"][account_num] = record
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+
                 self._write_json(self.sequence_file, data)
-
-            self._write_account_credentials(account_num, email, credentials)
-            self._write_account_config(account_num, email, config)
-            # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-            # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (email, "")}
-            )
-
-            data = self._get_sequence_data()
-            record = {
-                "email": email,
-                "uuid": "",
-                "organizationUuid": "",
-                "organizationName": "",
-                "added": get_timestamp(),
-            }
-            if is_api_key:
-                record["kind"] = "api_key"
-            record.update(gateway_fields)
-            if alias:
-                record["alias"] = alias
-            data["accounts"][account_num] = record
-            if int(account_num) not in data["sequence"]:
-                data["sequence"].append(int(account_num))
-                data["sequence"].sort()
-            data["lastUpdated"] = get_timestamp()
-
-            self._write_json(self.sequence_file, data)
         source_label = (
             "gateway" if gateway_fields else "API key" if is_api_key else "token"
         )
@@ -4404,6 +4484,10 @@ class ClaudeAccountSwitcher:
             data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
+            try:
+                self._account_write_marker(account_num).unlink(missing_ok=True)
+            except OSError:
+                raise ConfigError("Account removed but replacement marker cleanup failed; retry add-token with the intended slot before reuse") from None
             if account_info.get("kind") == "gateway":
                 self._usage_store.forget(
                     account_num, (email, account_info.get("organizationUuid", "") or "")
@@ -7288,6 +7372,7 @@ class ClaudeAccountSwitcher:
         which burns the stored grant of a slot whose backup is merely behind
         a locked Keychain. `session.py`'s `_bootstrap` carried a third copy.
         """
+        self._refuse_pending_account_write(account_num)
         creds, unreadable = self._read_account_credentials_ex(
             account_num, email
         )
