@@ -264,3 +264,35 @@ def test_gateway_real_collector_resumes_after_oauth_idle_hold(temp_home, monkeyp
     assert h.engine._idle_hold_since is None
     assert not h.engine._idle_hold_slow
     assert h.engine._unhealthy_ticks == 0
+
+
+def test_gateway_entry_captures_live_rotation_before_candidate_collection(temp_home, monkeypatch):
+    import json
+    from claude_swap import oauth
+    from claude_swap.paths import get_credentials_path
+
+    h = fleet(temp_home, monkeypatch)
+    h.seed(1, "one@example.com", expires_at=1000)
+    fresh = json.dumps({"claudeAiOauth": {
+        "accessToken": "rotated-access", "refreshToken": "rotated-refresh",
+        "expiresAt": 99_999_999_999_000,
+    }})
+    get_credentials_path().write_text(fresh)
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *a: {
+        "uuid": "uuid-1", "email": "one@example.com", "organizationUuid": ""})
+    h.switcher.switch_to("3", json_output=True)
+    observed = {}
+
+    def fetch(infos, pre):
+        observed.update({str(i[0]): i[5] for i in infos})
+        return {str(i[0]): FetchRecord(usage=_usage(10)) if i[5] == fresh
+                else FetchRecord(error="invalid_grant") for i in infos}
+
+    monkeypatch.setattr(h.switcher, "_run_usage_fetches", fetch)
+    monkeypatch.setattr(gateway, "probe", lambda *a, **kw: dict(
+        probeStatus="ok", probedAt=kw["now"], retryAt=None, budget=None))
+    assert h.engine.tick() == TickOutcome.NO_ACTION
+    assert observed["1"] == fresh
+    assert h.switcher.read_account_credentials("1", "one@example.com") == fresh
+    assert not h.switcher._slot_token_dead("1", "one@example.com")
+    assert not h.state().get("quarantine")
