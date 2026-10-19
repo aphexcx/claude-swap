@@ -7325,13 +7325,14 @@ class ClaudeAccountSwitcher:
             if is_gateway:
                 if source is None and source_num is not None and accounts[source_num].get("kind", "oauth") == "oauth":
                     live = self._read_credentials()
-                    if not live:
-                        raise CredentialReadError("Current account credential is empty; refusing to overwrite its backup")
-                    self._backup_outgoing_credential(
-                        source_num, identity[0], live,
-                        self._get_claude_config_path().read_text(encoding="utf-8"),
-                        provenance, data, emit_output, warnings_out,
-                    )
+                    # A missing OAuth login is itself a reason to recover
+                    # onto the gateway; activation never replaces that store.
+                    if live:
+                        self._backup_outgoing_credential(
+                            source_num, identity[0], live,
+                            self._get_claude_config_path().read_text(encoding="utf-8"),
+                            provenance, data, emit_output, warnings_out,
+                        )
                 # Existing OAuth sessions may still share settings via a
                 # symlink from before any gateway was added. Detach their
                 # auth settings before changing the default login, including
