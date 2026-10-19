@@ -857,6 +857,8 @@ class ClaudeAccountSwitcher:
             yield
             return
         retained_live = self._read_credentials() if gateway_active and explicit_replacement else ""
+        if retained_live is None:
+            raise CredentialReadError("Cannot replace an account while retained live credentials are unreadable")
         try:
             cleanup_slots = set(slots)
             for num in slots:
