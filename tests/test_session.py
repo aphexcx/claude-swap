@@ -3162,3 +3162,15 @@ def test_gateway_activation_prunes_dangling_oauth_settings_link(manager, temp_ho
     assert "apiKeyHelper" not in settings
     assert settings.get("env", {}).get("ANTHROPIC_BASE_URL") != "https://gateway.example"
     assert json.loads(source.read_text())["apiKeyHelper"] == gateway.helper("7")
+
+
+@pytest.mark.parametrize("value", [[], {}])
+def test_gateway_malformed_base_url_names_settings_file(share_setup, value):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    path = source / "settings.json"
+    path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": value}}))
+    with pytest.raises(SessionError, match=str(path)):
+        manager._sync_sharing(profile, share=True)

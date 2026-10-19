@@ -1127,7 +1127,12 @@ class SessionManager:
             for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
             if record.get("kind") == "gateway" and record.get("baseUrl")
         }
-        gateway_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL") in gateway_urls
+        base_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL")
+        if base_url is not None and not isinstance(base_url, str):
+            raise SessionError(
+                f"Cannot read Claude settings file {source}; ANTHROPIC_BASE_URL must be a string"
+            )
+        gateway_url = base_url in gateway_urls
         managed = source != path or path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
         if not gateway_session and not managed and not owned_helper and not gateway_url:
             return  # A profile-local customization belongs to its user.
