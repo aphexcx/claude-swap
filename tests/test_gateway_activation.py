@@ -20,6 +20,105 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("expiry,mode", [(1000, "direct"), (2000, "direct"), (None, "direct"),
+        (1000, "via-gateway"), (None, "refresh"), (2000, "move"), (None, "swap"),
+        (None, "stash-failure"), (None, "publication-failure")])
+    def test_gateway_return_preserves_explicit_oauth_replacement(self, gateway_switcher, temp_home, monkeypatch, expiry, mode):
+        from claude_swap import oauth
+        from claude_swap.exceptions import ClaudeSwitchError
+        from claude_swap.models import Platform
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        s.add_account_from_token(KEY + "-b", slot=3, base_url="https://b.example")
+        s.add_account_from_token("sk-ant-oat01-other", slot=4)
+        email = s.account_email("1")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 2000}})
+        s._write_account_credentials("1", email, old)
+        s.switch_to("1", force=True, json_output=True)
+        s.switch_to("2", json_output=True)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *args: None)
+        path = temp_home / "replacement.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        token = {"accessToken": "replacement-access", "refreshToken": "replacement-refresh"}
+        if expiry is not None:
+            token["expiresAt"] = expiry
+        envelope["accounts"][0]["credentials"] = {"claudeAiOauth": token}
+        path.write_text(json.dumps(envelope))
+        if mode == "publication-failure":
+            write = s._write_json
+            def fail_receipt(target, data):
+                if target == s.sequence_file and any(r.get("gatewayExplicitReplacement") for r in data.get("accounts", {}).values()):
+                    raise OSError("injected receipt failure")
+                return write(target, data)
+            with monkeypatch.context() as patch:
+                patch.setattr(s, "_write_json", fail_receipt)
+                with pytest.raises(ClaudeSwitchError):
+                    import_accounts(s, str(path), force=True)
+            assert s._read_account_credentials("1", email) == ""
+            assert s.gateway_credential("2") == KEY
+        import_accounts(s, str(path), force=True)
+        target = "1"
+        if mode == "via-gateway":
+            s.switch_to("3", json_output=True)
+        elif mode == "refresh":
+            token.update(accessToken="descendant-access", refreshToken="descendant-refresh")
+            s._write_account_credentials("1", email, json.dumps({"claudeAiOauth": token}))
+        elif mode == "move":
+            s.move_account("1", "5")
+            target = "5"
+        elif mode == "swap":
+            s.swap_accounts("1", "4")
+            target = "4"
+        fresh = ClaudeAccountSwitcher()
+        fresh.platform = Platform.LINUX
+        replacement = fresh._read_account_credentials(target, email)
+        if mode == "stash-failure":
+            settings = fresh._gateway_settings_path().read_bytes()
+            def fail_stash(*args):
+                raise OSError("injected stash failure")
+            with monkeypatch.context() as patch:
+                patch.setattr(fresh, "_stash_live_credential", fail_stash)
+                with pytest.raises(SwitchError):
+                    fresh.switch_to(target, json_output=True)
+            assert fresh._gateway_settings_path().read_bytes() == settings
+            assert fresh._read_account_credentials(target, email) == replacement
+        fresh.switch_to(target, json_output=True)
+        assert json.loads(fresh._read_credentials())["claudeAiOauth"] == token
+        assert fresh._read_account_credentials(target, email) == replacement
+        assert any(fresh._store._read_unclaimed_credential(i) == (old, False) for i in fresh.list_unclaimed_credentials())
+        assert not any(r.get("gatewayExplicitReplacement") for r in fresh._get_sequence_data()["accounts"].values())
+
+    @pytest.mark.parametrize("swap", [False, True])
+    @pytest.mark.parametrize("reimport", [False, True])
+    def test_gateway_return_keeps_unreplaced_live_rotation(self, gateway_switcher, temp_home, monkeypatch, swap, reimport):
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        s.add_account_from_token("sk-ant-oat01-other", slot=4)
+        email = s.account_email("1")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 2000}})
+        s._write_account_credentials("1", email, old)
+        s.switch_to("1", force=True, json_output=True)
+        s.switch_to("2", json_output=True)
+        if reimport:
+            path = temp_home / "unchanged.json"
+            export_accounts(s, str(path), account="1")
+            import_accounts(s, str(path), force=True)
+        rotated = json.dumps({"claudeAiOauth": {"accessToken": "rotated-access", "refreshToken": "rotated-refresh", "expiresAt": 9000}})
+        get_credentials_path().write_text(rotated)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *args: None)
+        if swap:
+            s.swap_accounts("1", "4")
+        target = "4" if swap else "1"
+        s.switch_to(target, json_output=True)
+        assert s._read_account_credentials(target, email) == rotated
+
     @pytest.mark.parametrize("token", ["sk-ant-api03-dummy", "sk-ant-oat01-dummy"])
     def test_gateway_return_keeps_replaced_nonrefreshable_credential(self, gateway_switcher, token):
         s = gateway_switcher

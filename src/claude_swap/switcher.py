@@ -836,7 +836,10 @@ class ClaudeAccountSwitcher:
             )
 
     @contextmanager
-    def _gateway_account_write(self, slots, *, gateway_requested: bool = False):
+    def _gateway_account_write(
+        self, slots, *, gateway_requested: bool = False,
+        explicit_replacement: bool = True,
+    ):
         """Fail closed across multi-file replacement; caller holds roster lock.
 
         The marker carries no credential. Ordinary store writes retain their
@@ -845,13 +848,15 @@ class ClaudeAccountSwitcher:
         """
         slots = sorted({str(num) for num in slots if num is not None})
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
-        guarded = gateway_requested or any(
+        gateway_active = gateway.active_slot(self._gateway_settings_path(), accounts) is not None
+        guarded = gateway_requested or (gateway_active and explicit_replacement) or any(
             accounts.get(num, {}).get("kind") == "gateway" or self._account_write_pending(num)
             for num in slots
         )
         if not guarded:
             yield
             return
+        retained_live = self._read_credentials() if gateway_active and explicit_replacement else ""
         try:
             cleanup_slots = set(slots)
             for num in slots:
@@ -865,7 +870,28 @@ class ClaudeAccountSwitcher:
             for num in slots:
                 atomic_write_text(self._account_write_marker(num), marker)
             yield
-            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            data = self._get_sequence_data() or {}
+            accounts = data.get("accounts", {})
+            if gateway_active and explicit_replacement:
+                # The live OAuth store is retained on gateway. An explicit
+                # import/replacement supersedes those bytes even when its
+                # expiry is earlier or absent. Publish intent before releasing
+                # the markers so a partial write cannot license the old live
+                # generation. Keeping it on the row follows moves and swaps.
+                for num in slots:
+                    if num in accounts and accounts[num].get("kind") != "gateway":
+                        replacement = self._store._read_account_credentials(num, accounts[num]["email"])
+                        live_oauth = oauth.extract_oauth_data(retained_live) or {}
+                        stored_oauth = oauth.extract_oauth_data(replacement) or {}
+                        same_generation = replacement == retained_live or (
+                            bool(live_oauth.get("accessToken"))
+                            and all(live_oauth.get(key) == stored_oauth.get(key) for key in ("accessToken", "refreshToken"))
+                        )
+                        if same_generation:
+                            accounts[num].pop("gatewayExplicitReplacement", None)
+                        else:
+                            accounts[num]["gatewayExplicitReplacement"] = True
+                self._write_json(self.sequence_file, data)
             for num in cleanup_slots:
                 # A retry can finish a migration after its source row was
                 # already deleted. Never release another still-managed row.
@@ -1222,7 +1248,7 @@ class ClaudeAccountSwitcher:
         config_a = self._read_account_config(num_a, email_a)
         config_b = self._read_account_config(num_b, email_b)
 
-        with self._gateway_account_write([num_a, num_b]):
+        with self._gateway_account_write([num_a, num_b], explicit_replacement=False):
             staging: dict[str, Path] = {}
             try:
                 if email_a == email_b:
@@ -7054,9 +7080,10 @@ class ClaudeAccountSwitcher:
                 data.get("accounts", {}).get(current_account, {}).get("kind") == "api_key"
                 or bool(stored.get("accessToken") and not stored.get("refreshToken"))
             )
-            if nonrefreshable and backup != original_creds:
-                # API keys/setup tokens do not rotate. A changed backup is an
-                # explicit replacement; the live store was idle on gateway.
+            explicit_replacement = data.get("accounts", {}).get(current_account, {}).get("gatewayExplicitReplacement")
+            if (nonrefreshable or explicit_replacement) and backup != original_creds:
+                # API keys/setup tokens do not rotate; refreshable imports
+                # carry explicit replacement intent independently of expiry.
                 return ("stored-replacement", None)
             try:
                 stored_newer = float(stored.get("expiresAt") or 0) > float(
@@ -7478,6 +7505,11 @@ class ClaudeAccountSwitcher:
 
         return get_claude_config_home() / "settings.json"
 
+    @staticmethod
+    def _clear_gateway_replacement_flags(data: dict) -> None:
+        for record in data.get("accounts", {}).values():
+            record.pop("gatewayExplicitReplacement", None)
+
     @contextmanager
     def _gateway_settings_transaction(
         self, target: str, *, provenance: dict, emit_output: bool, warnings_out: list,
@@ -7528,6 +7560,8 @@ class ClaudeAccountSwitcher:
         transaction.record_step("settings_written")
         try:
             if is_gateway:
+                if source is None:
+                    self._clear_gateway_replacement_flags(data)
                 if source is None and source_num is not None and accounts[source_num].get("kind", "oauth") == "oauth":
                     live = self._read_credentials()
                     # A missing OAuth login is itself a reason to recover
@@ -7901,6 +7935,7 @@ class ClaudeAccountSwitcher:
 
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
+                    self._clear_gateway_replacement_flags(data)
                     self._write_json(self.sequence_file, data)
                 except Exception:
                     if config_written and rollback_config_text is not None:
@@ -8040,6 +8075,7 @@ class ClaudeAccountSwitcher:
                 # Step 5: Update sequence state
                 data["activeAccountNumber"] = int(target_account)
                 data["lastUpdated"] = get_timestamp()
+                self._clear_gateway_replacement_flags(data)
                 self._write_json(self.sequence_file, data)
                 transaction.record_step("sequence_updated")
 
