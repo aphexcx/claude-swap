@@ -205,6 +205,7 @@ def export_accounts(
         record = accounts_map[num]
         email = record.get("email", "")
         org_uuid = record.get("organizationUuid", "") or ""
+        record, gateway_key = switcher.account_auth_snapshot(num, email, org_uuid)
 
         is_active = (
             current_identity is not None
@@ -223,7 +224,10 @@ def export_accounts(
                 raise ConfigError("Claude config file not found")
             config_text = config_path.read_text(encoding="utf-8")
         else:
-            creds_text = switcher._read_account_credentials(num, email)
+            creds_text = (
+                gateway_key if record.get("kind") == "gateway"
+                else switcher._read_account_credentials(num, email)
+            )
             config_text = switcher._read_account_config(num, email)
             if not creds_text or not config_text:
                 if explicit_account:

@@ -279,3 +279,36 @@ def test_gateway_collection_snapshots_endpoint_and_key_together(gateway_switcher
     monkeypatch.setattr(gateway, "probe", probe)
     s._collect_usage_entries(infos)
     assert pairs == [("https://new.example", KEY + "-replacement")]
+
+
+def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, temp_home, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    read = s._read_account_credentials
+    attempted = []
+
+    def racing_read(num, email):
+        lock = FileLock(s.lock_file)
+        acquired = lock.acquire(timeout=0)
+        attempted.append(acquired)
+        if acquired:
+            try:
+                data = s._get_sequence_data()
+                data["accounts"][num]["baseUrl"] = "https://new.example"
+                s._write_json(s.sequence_file, data)
+                s._write_account_credentials(num, email, KEY + "-replacement")
+            finally:
+                lock.release()
+        return read(num, email)
+
+    monkeypatch.setattr(s, "_read_account_credentials", racing_read)
+    path = temp_home / "gateway-export.json"
+    export_accounts(s, str(path))
+    row = json.loads(path.read_text())["accounts"][0]
+    assert attempted
+    assert (row["baseUrl"], row["credentials"]) in [
+        ("https://old.example", KEY), ("https://new.example", KEY + "-replacement"),
+    ]
+
