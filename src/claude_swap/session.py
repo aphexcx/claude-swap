@@ -1129,7 +1129,7 @@ class SessionManager:
 
         path = session_dir / "settings.json"
         source = source or path
-        if not source.exists() and not (gateway_session and session_dir.is_dir()):
+        if not source.exists():
             if path.is_symlink():
                 path.unlink()
             return
@@ -1232,8 +1232,7 @@ class SessionManager:
                         if dest.is_symlink():
                             dest.unlink()
                         if gateway_session and not dest.exists():
-                            # setup_session will generate an isolated file;
-                            # it must remain eligible for later shared updates.
+                            # Retain sharing intent while the source is absent.
                             new_managed.append(name)
                     continue
                 # Keep shared customizations as a copy. Linking would let a
