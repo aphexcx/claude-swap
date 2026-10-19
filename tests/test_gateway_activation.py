@@ -20,6 +20,30 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("operation", ["import", "add-token"])
+    def test_gateway_replacement_refuses_unreadable_retained_live_before_writes(self, gateway_switcher, temp_home, monkeypatch, operation):
+        from claude_swap.exceptions import CredentialReadError
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        email = s.account_email("1")
+        path = temp_home / "replacement.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0]["credentials"]["claudeAiOauth"]["accessToken"] = "replacement-access"
+        path.write_text(json.dumps(envelope))
+        before = s.sequence_file.read_bytes(), s._read_account_credentials("1", email)
+        monkeypatch.setattr(s, "_read_credentials", lambda: None)
+        with pytest.raises(CredentialReadError):
+            if operation == "import":
+                import_accounts(s, str(path), force=True)
+            else:
+                s.add_account_from_token("sk-ant-oat01-replacement", email=email)
+        assert (s.sequence_file.read_bytes(), s._read_account_credentials("1", email)) == before
+        assert not s._account_write_pending("1")
+
     @pytest.mark.parametrize("expiry,mode", [(1000, "direct"), (2000, "direct"), (None, "direct"),
         (1000, "via-gateway"), (None, "refresh"), (2000, "move"), (None, "swap"),
         (None, "stash-failure"), (None, "publication-failure")])
