@@ -35,6 +35,38 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
+    def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase):
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        s.add_account_from_token(KEY + "-b", slot=4, base_url="https://b.example")
+        s.switch_to("3", json_output=True)
+        activated = []
+        def activate_other():
+            if not activated:
+                activated.append(True)
+                s.switch_to("4", json_output=True)
+                activated.append((s._gateway_settings_path().read_bytes(), s._read_credentials()))
+        if phase == "freshening":
+            def prepare(*args):
+                activate_other()
+                return "ok"
+            monkeypatch.setattr(h.engine, "_prepare_target", prepare)
+        else:
+            prefetch = s._prefetch_live_identity
+            def race():
+                activate_other()
+                return prefetch()
+            monkeypatch.setattr(s, "_prefetch_live_identity", race)
+        entries = readings(h, second=10, status="exhausted")
+        entries["4"] = UsageEntry(sentinel="gateway", gateway=dict(probeStatus="ok", probedAt=h.clock(), budget=None))
+        assert h.tick_with_entries(entries) == TickOutcome.NO_ACTION
+        assert h.active_number() == 4
+        assert s.gateway_credential("4") == KEY + "-b"
+        assert (s._gateway_settings_path().read_bytes(), s._read_credentials()) == activated[1]
+        assert not any(isinstance(e, SwitchEvent) for e in h.events)
+        assert "lastSwitchAt" not in h.state()
+
     @pytest.mark.parametrize("failure", ["skip-live-session", "transient", "identity-conflict"])
     def test_oauth_freshening_failure_tries_api_key_before_gateway(self, temp_home, monkeypatch, failure):
         from dataclasses import replace

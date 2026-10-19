@@ -50,7 +50,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, StaleSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
@@ -1807,7 +1807,7 @@ class AutoSwitchEngine:
         for num in ordered:
             email = self.switcher.account_email(num)
             if self.dry_run:
-                return self._perform(num, email, trigger, (None, float("inf")))
+                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current)
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant", "skip-live-session"):
                 continue
@@ -1818,7 +1818,7 @@ class AutoSwitchEngine:
                 if not systemic or _SYSTEMIC_STATUSES.index(status) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            return self._perform(num, email, trigger, (None, float("inf")))
+            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current)
         if systemic or transient_failure:
             self._emit(ErrorEvent(
                 message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
@@ -2702,6 +2702,7 @@ class AutoSwitchEngine:
         email: str,
         trigger: str,
         left: tuple[float | None, float],
+        *, expected_source: str | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2732,7 +2733,12 @@ class AutoSwitchEngine:
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            try:
+                source_args = {"expected_source": expected_source} if expected_source is not None else {}
+                result = self.switcher.switch_to(number, json_output=True, **source_args)
+            except StaleSwitchError:
+                self._emit(NoSwitchEvent(reason="active-account-changed"))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
