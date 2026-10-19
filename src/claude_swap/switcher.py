@@ -950,7 +950,7 @@ class ClaudeAccountSwitcher:
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
-    def resolve_account(self, identifier: str) -> tuple[str, str, str]:
+    def resolve_account(self, identifier: str, *, locked: bool = False) -> tuple[str, str, str]:
         """Resolve NUM|EMAIL to (account_num, email, organizationUuid).
 
         Unlike switch_to/remove_account, ambiguity is a hard error rather
@@ -961,7 +961,7 @@ class ClaudeAccountSwitcher:
             AccountNotFoundError: identifier doesn't match any account.
             ConfigError: email matches multiple accounts.
         """
-        self._get_sequence_data_migrated()
+        self._get_sequence_data_migrated(locked=locked)
         account_num = self._resolve_account_identifier(identifier)
         if not account_num:
             raise AccountNotFoundError(
@@ -989,31 +989,32 @@ class ClaudeAccountSwitcher:
             ValidationError: alias format is invalid.
             ConfigError: the normalized alias is already used by another account.
         """
-        self._refuse_session_shell()
-        try:
-            normalized = normalize_alias(alias)
-        except ValueError as e:
-            raise ValidationError(str(e)) from e
+        with FileLock(self.lock_file):
+            self._refuse_session_shell()
+            try:
+                normalized = normalize_alias(alias)
+            except ValueError as e:
+                raise ValidationError(str(e)) from e
 
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            self._get_sequence_data_migrated(locked=True)
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        conflict = self._alias_in_use(normalized, exclude_num=account_num)
-        if conflict is not None:
-            raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
+            conflict = self._alias_in_use(normalized, exclude_num=account_num)
+            if conflict is not None:
+                raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
 
-        record["alias"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        return account_num, normalized
+            record["alias"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            return account_num, normalized
 
     def unset_alias(self, identifier: str) -> str:
         """Clear the alias for the account matching identifier.
@@ -1025,23 +1026,24 @@ class ClaudeAccountSwitcher:
         Raises:
             AccountNotFoundError: identifier doesn't match any account.
         """
-        self._refuse_session_shell()
-        self._get_sequence_data_migrated()
-        account_num = self._resolve_account_identifier(identifier)
-        if not account_num:
-            raise AccountNotFoundError(
-                f"No account found with identifier: {identifier}"
-            )
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+        with FileLock(self.lock_file):
+            self._refuse_session_shell()
+            self._get_sequence_data_migrated(locked=True)
+            account_num = self._resolve_account_identifier(identifier)
+            if not account_num:
+                raise AccountNotFoundError(
+                    f"No account found with identifier: {identifier}"
+                )
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        if "alias" in record:
-            del record["alias"]
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
-        return account_num
+            if "alias" in record:
+                del record["alias"]
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+            return account_num
 
     def list_aliases(self) -> list[tuple[str, str, str]]:
         """Every set alias as ``(account_num, alias, email)``, slot-number order."""
@@ -1115,7 +1117,7 @@ class ClaudeAccountSwitcher:
         number resolved outside the lock could be renumbered by a concurrent
         swap/move and target the wrong account.
         """
-        self._get_sequence_data_migrated()
+        self._get_sequence_data_migrated(locked=True)
 
         num_a = self._resolve_account_identifier(first)
         if not num_a:
@@ -1531,7 +1533,7 @@ class ClaudeAccountSwitcher:
         # a slot number resolved outside the lock could be renumbered by a
         # concurrent swap/move and end up moving the wrong account.
         with FileLock(self.lock_file):
-            self._get_sequence_data_migrated()
+            self._get_sequence_data_migrated(locked=True)
 
             num_src = self._resolve_account_identifier(account)
             if not num_src:
@@ -1977,7 +1979,7 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(data, str(num))
         ]
 
-    def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
+    def _resolve_for_policy_write(self, identifier: str, *, locked: bool = False) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
         Called by :meth:`set_account_threshold`. Every
@@ -1995,7 +1997,7 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No accounts are managed yet")
 
         # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+        account_num, email, _ = self.resolve_account(identifier, locked=locked)
 
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
@@ -2031,40 +2033,41 @@ class ClaudeAccountSwitcher:
         """
         # Validate first: a bad value must never reach the file. Resolution
         # order matters only in that both checks precede the single write.
-        normalized = None if threshold is None else normalize_account_threshold(threshold)
+        with FileLock(self.lock_file):
+            normalized = None if threshold is None else normalize_account_threshold(threshold)
 
-        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+            account_num, email, data, record = self._resolve_for_policy_write(identifier, locked=True)
 
-        current = record.get("threshold")
-        if normalized is None and "threshold" not in record:
-            print(dimmed(
-                f"Account-{account_num} ({email}) has no threshold override "
-                f"— already using the global default."
-            ))
-            return
-        if normalized is not None and current == normalized:
-            print(dimmed(
-                f"Account-{account_num} ({email}) is already at {normalized:g}%."
-            ))
-            return
+            current = record.get("threshold")
+            if normalized is None and "threshold" not in record:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) has no threshold override "
+                    f"— already using the global default."
+                ))
+                return
+            if normalized is not None and current == normalized:
+                print(dimmed(
+                    f"Account-{account_num} ({email}) is already at {normalized:g}%."
+                ))
+                return
 
-        if normalized is None:
-            record.pop("threshold", None)
-        else:
-            record["threshold"] = normalized
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
+            if normalized is None:
+                record.pop("threshold", None)
+            else:
+                record["threshold"] = normalized
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
 
-        if normalized is None:
-            self._logger.info(f"Cleared threshold for account {account_num}: {email}")
-            print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
-                  f"— now using the global default.")
-        else:
-            self._logger.info(
-                f"Set threshold {normalized:g} for account {account_num}: {email}"
-            )
-            print(f"{accent('Set')} Account-{account_num} ({email}) "
-                  f"threshold to {normalized:g}%.")
+            if normalized is None:
+                self._logger.info(f"Cleared threshold for account {account_num}: {email}")
+                print(f"{accent('Cleared')} threshold for Account-{account_num} ({email}) "
+                      f"— now using the global default.")
+            else:
+                self._logger.info(
+                    f"Set threshold {normalized:g} for account {account_num}: {email}"
+                )
+                print(f"{accent('Set')} Account-{account_num} ({email}) "
+                      f"threshold to {normalized:g}%.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
@@ -2080,47 +2083,48 @@ class ClaudeAccountSwitcher:
             ConfigError: no accounts are managed yet, or the email is ambiguous.
             AccountNotFoundError: identifier doesn't match any account.
         """
-        if not self.sequence_file.exists():
-            raise ConfigError("No accounts are managed yet")
+        with FileLock(self.lock_file):
+            if not self.sequence_file.exists():
+                raise ConfigError("No accounts are managed yet")
 
-        # resolve_account migrates org fields and hard-errors on ambiguity.
-        account_num, email, _ = self.resolve_account(identifier)
+            # resolve_account migrates org fields and hard-errors on ambiguity.
+            account_num, email, _ = self.resolve_account(identifier, locked=True)
 
-        data = self._get_sequence_data() or {}
-        record = data.get("accounts", {}).get(account_num)
-        if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(account_num)
+            if not record:
+                raise AccountNotFoundError(f"Account-{account_num} does not exist")
 
-        verb = "disabled" if disabled else "enabled"
-        if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
-            return
+            verb = "disabled" if disabled else "enabled"
+            if bool(record.get("disabled")) == disabled:
+                print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+                return
 
-        if disabled:
-            record["disabled"] = True
-        else:
-            record.pop("disabled", None)
-        data["lastUpdated"] = get_timestamp()
-        self._write_json(self.sequence_file, data)
-        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
+            if disabled:
+                record["disabled"] = True
+            else:
+                record.pop("disabled", None)
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
 
-        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+            print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
 
-        if disabled:
-            active = data.get("activeAccountNumber")
-            if str(active) == account_num:
-                print(dimmed(
-                    "  It is the active account — it stays live until you switch "
-                    "away; it just won't be an automatic switch target."
-                ))
-            if not self.switchable_account_numbers():
-                warning(
-                    "  No accounts remain in rotation — auto-switch and bare "
-                    "switch have nothing to pick. Re-enable one with "
-                    "cswap enable <num|email>."
-                )
-        else:
-            print(dimmed("  It is back in the rotation."))
+            if disabled:
+                active = data.get("activeAccountNumber")
+                if str(active) == account_num:
+                    print(dimmed(
+                        "  It is the active account — it stays live until you switch "
+                        "away; it just won't be an automatic switch target."
+                    ))
+                if not self.switchable_account_numbers():
+                    warning(
+                        "  No accounts remain in rotation — auto-switch and bare "
+                        "switch have nothing to pick. Re-enable one with "
+                        "cswap enable <num|email>."
+                    )
+            else:
+                print(dimmed("  It is back in the rotation."))
 
     def account_kind_for(self, account_num: str) -> str:
         """Public wrapper: ``"api_key"`` or ``"oauth"`` (setup-tokens read as oauth)."""
@@ -3139,8 +3143,11 @@ class ClaudeAccountSwitcher:
             f"Removed session profile for account {account_num} at {session_dir}"
         )
 
-    def _init_sequence_file(self) -> None:
+    def _init_sequence_file(self, *, locked: bool = False) -> None:
         """Initialize sequence.json if it doesn't exist."""
+        if not locked:
+            with FileLock(self.lock_file):
+                return self._init_sequence_file(locked=True)
         if not self.sequence_file.exists():
             init_data = {
                 "activeAccountNumber": None,
@@ -3645,7 +3652,7 @@ class ClaudeAccountSwitcher:
             f"Use account number instead (e.g., cswap --switch-to 1)."
         )
 
-    def _get_sequence_data_migrated(self) -> dict | None:
+    def _get_sequence_data_migrated(self, *, locked: bool = False) -> dict | None:
         """Get sequence data, ensuring org-field migration has run."""
         data = self._get_sequence_data()
         if not data:
@@ -3655,17 +3662,20 @@ class ClaudeAccountSwitcher:
             for acc in data.get("accounts", {}).values()
         )
         if needs_migration:
-            self._migrate_org_fields()
+            self._migrate_org_fields(locked=locked)
             data = self._get_sequence_data()  # Re-read after migration
         return data
 
-    def _migrate_org_fields(self) -> None:
+    def _migrate_org_fields(self, *, locked: bool = False) -> None:
         """Backfill organizationUuid/Name for accounts added before org support.
 
         For the currently active account, reads org info from the live config
         (which is authoritative). For inactive accounts, falls back to backup
         configs. Writes updated fields back to sequence.json.
         """
+        if not locked:
+            with FileLock(self.lock_file):
+                return self._migrate_org_fields(locked=True)
         data = self._get_sequence_data()
         if not data:
             return

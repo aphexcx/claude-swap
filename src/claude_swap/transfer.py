@@ -474,13 +474,13 @@ def import_accounts(
     # keyring) are environmental and don't reflect on the file's integrity.
     switcher._setup_directories()
     with FileLock(switcher.lock_file):
-        switcher._init_sequence_file()
+        switcher._init_sequence_file(locked=True)
         _import_accounts_locked(switcher, envelope, normalized, force)
 
 
 def _import_accounts_locked(switcher, envelope, normalized, force):
     """Keep replacement validation and all writes under the roster lock."""
-    data = switcher._get_sequence_data_migrated() or {}
+    data = switcher._get_sequence_data_migrated(locked=True) or {}
     for entry in normalized:
         slot = switcher._find_account_slot(data, entry["email"], entry["org_uuid"])
         if slot is not None and (force or switcher._slot_token_dead(slot, entry["email"])):
@@ -511,7 +511,7 @@ def _import_accounts_locked(switcher, envelope, normalized, force):
         )
 
         # Re-read sequence each iteration so per-account writes see prior updates
-        data = switcher._get_sequence_data_migrated() or {
+        data = switcher._get_sequence_data_migrated(locked=True) or {
             "activeAccountNumber": None,
             "lastUpdated": get_timestamp(),
             "sequence": [],
