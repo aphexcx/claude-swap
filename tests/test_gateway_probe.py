@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from claude_swap import gateway
-from claude_swap.usage_store import UsageStore
+from claude_swap.usage_store import FetchRecord, UsageStore
 from tests.test_gateway_accounts import KEY
 
 
@@ -34,6 +34,30 @@ def respond(monkeypatch, status, message="", retry=None):
 
 
 class TestGatewayProbe:
+    @pytest.mark.parametrize("reset", ["clear_dead_token", "record"])
+    def test_oauth_cache_write_clears_prior_gateway_state(self, temp_home, monkeypatch, reset):
+        store = UsageStore(temp_home / "cache", clock=lambda: 1000.0)
+        identity = {"1": ("same@example.com", "")}
+        respond(monkeypatch, 200)
+        store.collect_gateway(
+            "1", identity["1"], gateway.account_fields("https://gateway.example"), KEY,
+            active=False, fetch=True,
+        )
+        assert store.entries(identity)["1"].sentinel == "gateway"
+        usage = {"five_hour": {"pct": 10.0}}
+        if reset == "clear_dead_token":
+            store.clear_dead_token(["1"], identity)
+        else:
+            store.record({"1": FetchRecord(usage=usage)}, identity)
+        entry = store.entries(identity)["1"]
+        assert entry.sentinel is None and entry.gateway is None
+        assert entry.next_poll_at is None
+        assert not any(key.startswith("gateway") for key in store._read_rows()["1"])
+        if reset == "record":
+            assert entry.decision_value() == usage
+        else:
+            assert "1" in store.reserve(["1"], identity, respect_plans=True)
+
     @pytest.mark.parametrize(
         "status,verdict",
         [

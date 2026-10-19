@@ -4331,6 +4331,10 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
+        if account_info.get("kind") == "gateway":
+            self._usage_store.forget(
+                account_num, (email, account_info.get("organizationUuid", "") or "")
+            )
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 

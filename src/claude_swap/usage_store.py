@@ -982,6 +982,21 @@ class UsageStore:
 
     # -- writes ---------------------------------------------------------------
 
+    def forget(self, num: str, identity: Identity) -> None:
+        """Remove a deleted account's cache and invalidate in-flight probes."""
+        with self._lock():
+            rows = self._read_rows()
+            if self._matches(rows.get(num), identity):
+                del rows[num]
+                self._write_rows(rows)
+
+    def _reset_gateway_row(self, row: dict, identity: Identity) -> None:
+        if "gateway" in row or "gatewayFingerprint" in row:
+            # Kind changes can keep the same slot/email/org. Discard the
+            # gateway verdict, lease and schedule before OAuth uses the row.
+            row.clear()
+            row.update(self._fresh_row(identity))
+
     def collect_gateway(
         self,
         num: str,
@@ -1185,6 +1200,8 @@ class UsageStore:
         def apply(num: str, row: dict) -> None:
             accepted.add(num)
             rec = outcomes[num]
+            if rec.sentinel is None and rec.error is None:
+                self._reset_gateway_row(row, identities[num])
             row["claimId"] = None
             row["claimUntil"] = 0.0
             if rec.sentinel is not None:
@@ -1353,6 +1370,7 @@ class UsageStore:
             return
 
         def apply(_num: str, row: dict) -> None:
+            self._reset_gateway_row(row, identities[_num])
             row["claimId"] = None
             row["claimUntil"] = 0.0
             row["authDeadStrikes"] = 0
