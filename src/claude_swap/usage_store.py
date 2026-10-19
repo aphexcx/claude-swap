@@ -1034,7 +1034,6 @@ class UsageStore:
                 due = min(due, prior["probedAt"] + gateway.ACTIVE_INTERVAL_S)
             if (
                 fetch
-                and key
                 and prior.get("probeStatus") != "unauthorized"
                 and now >= due
                 and now >= row.get("claimUntil", 0)
@@ -1048,8 +1047,17 @@ class UsageStore:
                 rows[num] = row
                 self._write_rows(rows)
         if claim:
-            verdict = gateway.probe(record, key, now=now, previous=prior)
-            budget = gateway.usage(record, key)
+            if key:
+                verdict = gateway.probe(record, key, now=now, previous=prior)
+            else:
+                since = prior.get("failureSince", prior.get("transientSince", now))
+                verdict = {
+                    "probeStatus": "transient", "probedAt": now, "budget": None,
+                    "errorType": "credential_unavailable",
+                    "message": "Gateway credential is unavailable",
+                    "failureSince": since, "transientSince": since,
+                }
+            budget = gateway.usage(record, key) if key else None
             if isinstance(budget, dict):
                 verdict["budget"] = budget
             deadline = gateway.next_probe_at(verdict, active=active, now=now)

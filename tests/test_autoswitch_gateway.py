@@ -296,3 +296,20 @@ def test_gateway_entry_captures_live_rotation_before_candidate_collection(temp_h
     assert h.switcher.read_account_credentials("1", "one@example.com") == fresh
     assert not h.switcher._slot_token_dead("1", "one@example.com")
     assert not h.state().get("quarantine")
+
+
+def test_gateway_unavailable_credential_has_bounded_departure(temp_home, monkeypatch):
+    h = fleet(temp_home, monkeypatch)
+    h.switcher.switch_to("3", json_output=True)
+    read = h.switcher._read_account_credentials
+    monkeypatch.setattr(h.switcher, "_read_account_credentials", lambda n, email: "" if n == "3" else read(n, email))
+    monkeypatch.setattr(h.switcher, "_run_usage_fetches", lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(10)) for i in infos})
+    probe = Mock()
+    monkeypatch.setattr(gateway, "probe", probe)
+    assert h.engine.tick() == TickOutcome.NO_ACTION
+    verdict = h.switcher.usage_entries_by_account(fetch=set())["3"].gateway
+    assert verdict and verdict["probeStatus"] == "transient"
+    h.clock.advance(601)
+    assert h.engine.tick() == TickOutcome.SWITCHED
+    assert h.active_number() in (1, 2)
+    assert not probe.called
