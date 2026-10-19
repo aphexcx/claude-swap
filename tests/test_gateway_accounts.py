@@ -38,6 +38,34 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    def test_gateway_replaced_by_oauth_clears_cache_and_polls(
+        self, gateway_switcher, monkeypatch
+    ):
+        from claude_swap.usage_store import FetchRecord
+
+        s = gateway_switcher
+        email = "same@example.com"
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=1, email=email)
+        record = s._get_sequence_data()["accounts"]["1"]
+        store = s._usage_store
+        store.collect_gateway("1", (email, ""), record, KEY, active=False, fetch=True)
+        assert store.entries({"1": (email, "")})["1"].sentinel == "gateway"
+        s.remove_account("1", assume_yes=True)
+        assert "1" not in store._read_rows()
+        s.add_account_from_token("sk-ant-oat01-dummy", slot=1, email=email)
+        usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
+        polled = []
+
+        def fetch(infos, pre):
+            polled.extend(str(info[0]) for info in infos)
+            return {str(info[0]): FetchRecord(usage=usage) for info in infos}
+
+        monkeypatch.setattr(s, "_run_usage_fetches", fetch)
+        entry = s.usage_entries_by_account()["1"]
+        assert polled == ["1"]
+        assert entry.sentinel is None and entry.gateway is None
+        assert entry.decision_value() == usage
+
     @pytest.mark.parametrize("key", [KEY, "sk-ant-oat01-dummy", "sk-ant-api03-dummy"])
     def test_raw_record_and_defaults(self, gateway_switcher, key):
         s = gateway_switcher
