@@ -722,24 +722,15 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
         if self.switcher._account_kind(account_num) == "gateway":
-            from claude_swap import gateway
-
             _mkdir_private(session_dir)
-            self._sync_sharing(session_dir, share, share_history)
-            # A default-login gateway helper/base URL must not override this
-            # session's explicit exec environment. Keep other customizations.
-            settings_path = session_dir / "settings.json"
-            settings = gateway.read_settings(settings_path)
-            settings.pop("apiKeyHelper", None)
-            for name in (
-                "ANTHROPIC_BASE_URL",
-                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
-            ):
-                settings.get("env", {}).pop(name, None)
-            if settings_path.is_symlink():
-                settings_path.unlink()
-            gateway.atomic_bytes(settings_path, json.dumps(settings).encode())
+            self._sync_sharing(session_dir, share, share_history, gateway_session=True)
+            self._isolate_auth_settings(session_dir, gateway_session=True)
             return session_dir, account_num, email
+
+        if self._has_gateway_accounts():
+            # Repair old shared profiles before even the local auth probe:
+            # its result must describe this OAuth account, not the default.
+            self._isolate_auth_settings(session_dir)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1105,8 +1096,41 @@ class SessionManager:
 
     # -- sharing ---------------------------------------------------------
 
+    def _has_gateway_accounts(self) -> bool:
+        return any(
+            record.get("kind") == "gateway"
+            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
+        )
+
+    def _isolate_auth_settings(
+        self, session_dir: Path, *, gateway_session: bool = False,
+        source: Path | None = None,
+    ) -> None:
+        """Copy customizations without inheriting default-login gateway auth."""
+        from claude_swap import gateway
+
+        path = session_dir / "settings.json"
+        source = source or path
+        if not source.exists() and not (gateway_session and session_dir.is_dir()):
+            return
+        settings = gateway.read_settings(source)
+        if gateway_session or gateway.owned_slot(settings.get("apiKeyHelper")) is not None:
+            settings.pop("apiKeyHelper", None)
+        env = settings.setdefault("env", {})
+        env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+        if gateway_session:
+            env.pop("ANTHROPIC_BASE_URL", None)
+        else:
+            env["ANTHROPIC_BASE_URL"] = gateway.FIRST_PARTY_URL
+        if not env:
+            settings.pop("env", None)
+        if path.is_symlink():
+            path.unlink()
+        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+
     def _sync_sharing(
-        self, session_dir: Path, share: bool, share_history: bool = False
+        self, session_dir: Path, share: bool, share_history: bool = False,
+        *, gateway_session: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
 
@@ -1136,6 +1160,7 @@ class SessionManager:
         source_root = Path.home() / ".claude"
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
+        isolate_settings = gateway_session or self._has_gateway_accounts()
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
@@ -1158,6 +1183,17 @@ class SessionManager:
         for name in active_items:
             src = source_root / name
             dest = session_dir / name
+
+            if name == "settings.json" and isolate_settings:
+                # Keep shared customizations as a copy. Linking would let a
+                # later default gateway switch change this session's auth.
+                source = src if name in managed or not dest.exists() or dest.is_symlink() else dest
+                self._isolate_auth_settings(
+                    session_dir, gateway_session=gateway_session, source=source
+                )
+                if source == src and src.exists():
+                    new_managed.append(name)
+                continue
 
             if name in HISTORY_ITEMS and not self._prepare_history_share(
                 src, dest, session_dir
