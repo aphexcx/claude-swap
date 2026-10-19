@@ -2848,10 +2848,10 @@ class AutoSwitchEngine:
         if outcome is TickOutcome.BLOCKED:
             if self._sleep_until_ts is not None:
                 delay = self._sleep_until_ts - self.clock()
-                return min(max(delay, interval), MAX_SLEEP_S)
+                return self._respect_gateway_poll_plan(min(max(delay, interval), MAX_SLEEP_S))
             if self._blocked_wait_long:
                 # Truly exhausted with no reset time known / no candidates.
-                return max(interval, NO_RESET_FALLBACK_S)
+                return self._respect_gateway_poll_plan(max(interval, NO_RESET_FALLBACK_S))
             # Blocked on something that can resolve any tick (hysteresis,
             # unreadable usage) — keep the normal cadence so the at-limit
             # escape isn't missed.
@@ -2859,9 +2859,40 @@ class AutoSwitchEngine:
             # Idle-hold: Claude is idle on an expired token — nothing changes
             # until the user comes back, so crawl. Worst case protection
             # resumes one slow tick after they do.
-            return max(interval, NO_RESET_FALLBACK_S)
+            return self._respect_gateway_poll_plan(max(interval, NO_RESET_FALLBACK_S))
         # ±10% jitter so multiple machines don't synchronize their API hits.
-        return self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        return self._respect_gateway_poll_plan(
+            self._respect_poll_plan(interval * (0.9 + 0.2 * random.random()))
+        )
+
+    def _respect_gateway_poll_plan(self, delay: float) -> float:
+        """Keep enabled gateway recovery deadlines even during OAuth waits."""
+        try:
+            current = self.switcher.current_account_number()
+            if current is None:
+                return delay
+            quarantine = self._read_state().get("quarantine", {})
+            quarantined = set(quarantine) if isinstance(quarantine, dict) else set()
+            slots = {
+                num for num in self.switcher.switchable_account_numbers()
+                if self.settings.include_gateway_accounts
+                and num not in quarantined
+                and self.switcher.account_kind_for(num) == "gateway"
+            }
+            if self.switcher.account_kind_for(current) == "gateway":
+                slots.add(current)
+            if not slots:
+                return delay
+            entries = self.switcher.usage_entries_by_account(fetch=set())
+            now = self.clock()
+            for num in slots:
+                entry = entries.get(num)
+                if (entry is not None and entry.next_poll_at is not None
+                        and (entry.gateway or {}).get("probeStatus") != "unauthorized"):
+                    delay = min(delay, max(entry.next_poll_at - now, 1.0))
+            return delay
+        except Exception:
+            return delay
 
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
