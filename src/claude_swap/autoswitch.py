@@ -1467,11 +1467,11 @@ class AutoSwitchEngine:
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
-        elif gateway_candidates and trigger != "consume-first":
+        elif api_key_candidates and trigger != "consume-first":
             # Ranked OAuth seats may still be unusable (a live session,
             # refresh failure, or identity conflict). Exhaust those choices
-            # before trying a healthy gateway in the same tick.
-            ordered = [*ordered, *gateway_candidates]
+            # before trying opted-in API keys, then healthy gateways.
+            ordered = [*ordered, *api_key_candidates]
 
         if not ordered:
             if not any_known:
