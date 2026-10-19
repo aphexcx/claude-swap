@@ -311,3 +311,30 @@ class TestGatewayActivation:
             json.loads(target.read_text())["env"]["ANTHROPIC_BASE_URL"]
             == "https://gateway.example"
         )
+
+
+def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_switcher):
+    from claude_swap import oauth
+
+    s = gateway_switcher
+    seed_oauth(s)
+    email = s.account_email("1")
+    original = json.loads(s.read_account_credentials("1", email))
+    original["claudeAiOauth"].update(accessToken="own-access", refreshToken="own-refresh", expiresAt=2000)
+    backup = json.dumps(original)
+    s._write_account_credentials("1", email, backup)
+    s.switch_to("1", force=True, json_output=True)
+    s.switch_to("2", json_output=True)
+    foreign = json.dumps({"claudeAiOauth": {
+        "accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": 1000,
+    }})
+    get_credentials_path().write_text(foreign)
+    s._probe_verdicts[s._lineage_key("1", email, oauth.credential_fingerprint(foreign))] = False
+    s.switch_to("1", json_output=True)
+    assert s.read_account_credentials("1", email) == backup
+    assert json.loads(get_credentials_path().read_text()) == original
+    stash = s.list_unclaimed_credentials()
+    assert len(stash) == 1
+    entry_id, metadata = next(iter(stash.items()))
+    assert metadata["reason"] == "known-foreign"
+    assert s._store._read_unclaimed_credential(entry_id) == foreign
