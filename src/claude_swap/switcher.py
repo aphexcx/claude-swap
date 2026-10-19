@@ -6845,14 +6845,34 @@ class ClaudeAccountSwitcher:
         return result
 
     def _classify_outgoing_credential(
-        self,
-        current_account: str,
-        current_email: str,
-        original_creds: str,
-        provenance: dict,
-        data: dict,
-        *,
-        gateway_return: bool = False,
+        self, current_account, current_email, original_creds, provenance, data,
+        *, gateway_return=False,
+    ) -> tuple[str, str | None]:
+        """Establish ownership before choosing which OAuth generation to keep."""
+        kind, foreign_slot = self._classify_outgoing_ownership(
+            current_account, current_email, original_creds, provenance, data,
+        )
+        if kind not in ("own-bytes", "own-family", "own-rotated", "unresolved"):
+            return kind, foreign_slot
+        backup = self._read_account_credentials(current_account, current_email)
+        if gateway_return and backup:
+            # Polling can rotate the OAuth backup while the gateway leaves
+            # the live login untouched. Identity alone cannot distinguish
+            # those generations: never copy the older live token back.
+            stored = oauth.extract_oauth_data(backup) or {}
+            live = oauth.extract_oauth_data(original_creds) or {}
+            try:
+                stored_newer = float(stored.get("expiresAt") or 0) > float(
+                    live.get("expiresAt") or 0
+                )
+            except (TypeError, ValueError):
+                stored_newer = False
+            if stored_newer and stored.get("accessToken"):
+                return ("stored-newer", None)
+        return kind, foreign_slot
+
+    def _classify_outgoing_ownership(
+        self, current_account, current_email, original_creds, provenance, data,
     ) -> tuple[str, str | None]:
         """Decide what the switch-time backup may do with the live credential.
 
@@ -6860,8 +6880,6 @@ class ClaudeAccountSwitcher:
 
         - ``"own-bytes"``      — byte-identical to the slot's stored backup;
           nothing changed, nothing to capture.
-        - ``"stored-newer"``   — returning from a gateway with a backup
-          newer than the idle live OAuth credential; keep the backup.
         - ``"own-family"``     — same refresh-token lineage (access token
           rotated); back up normally.
         - ``"own-rotated"``    — full rotation, but the profile endpoint
@@ -6908,20 +6926,6 @@ class ClaudeAccountSwitcher:
           the extra safety.
         """
         backup = self._read_account_credentials(current_account, current_email)
-        if gateway_return and backup:
-            # Polling can rotate the OAuth backup while the gateway leaves
-            # the live login untouched. Identity alone cannot distinguish
-            # those generations: never copy the older live token back.
-            stored = oauth.extract_oauth_data(backup) or {}
-            live = oauth.extract_oauth_data(original_creds) or {}
-            try:
-                stored_newer = float(stored.get("expiresAt") or 0) > float(
-                    live.get("expiresAt") or 0
-                )
-            except (TypeError, ValueError):
-                stored_newer = False
-            if stored_newer and stored.get("accessToken"):
-                return ("stored-newer", None)
         if backup and backup == original_creds:
             return ("own-bytes", None)
         if backup and (
