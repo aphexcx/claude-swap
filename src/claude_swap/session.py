@@ -643,13 +643,8 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-        record = (
-            (self.switcher._get_sequence_data() or {})
-            .get("accounts", {})
-            .get(account_num, {})
-        )
+        record, key = self.switcher.account_auth_snapshot(account_num, email, org_uuid)
         if record.get("kind") == "gateway":
-            key = self.switcher.read_account_credentials(account_num, email)
             if not key:
                 raise SessionError("Gateway account has no stored credential")
             env["ANTHROPIC_BASE_URL"] = record["baseUrl"]

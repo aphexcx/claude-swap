@@ -265,3 +265,17 @@ def test_forced_import_preflights_all_accounts_before_active_gateway_refusal(gat
     assert {n: s.read_account_credentials(n, s.account_email(n)) for n in ("1", "2")} == credentials
     assert s.sequence_file.read_bytes() == sequence
     assert s._gateway_settings_path().read_bytes() == settings
+
+
+def test_gateway_collection_snapshots_endpoint_and_key_together(gateway_switcher, monkeypatch):
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    infos = s._build_accounts_info()
+    s.add_account_from_token(KEY + "-replacement", base_url="https://new.example", slot=1, assume_yes=True)
+    pairs = []
+    def probe(record, key, **kw):
+        pairs.append((record["baseUrl"], key))
+        return dict(probeStatus="ok", probedAt=kw["now"], budget=None)
+    monkeypatch.setattr(gateway, "probe", probe)
+    s._collect_usage_entries(infos)
+    assert pairs == [("https://new.example", KEY + "-replacement")]
