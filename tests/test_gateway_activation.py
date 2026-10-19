@@ -338,3 +338,18 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_
     entry_id, metadata = next(iter(stash.items()))
     assert metadata["reason"] == "known-foreign"
     assert s._store._read_unclaimed_credential(entry_id) == (foreign, False)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_gateway_entry_can_recover_without_live_oauth_credentials(gateway_switcher, missing):
+    s = gateway_switcher
+    seed_oauth(s)
+    backup = s.read_account_credentials("1", s.account_email("1"))
+    if missing:
+        get_credentials_path().unlink()
+    else:
+        get_credentials_path().write_text("")
+    s.switch_to("2", json_output=True)
+    assert s.current_account_number() == "2"
+    assert s.gateway_credential("2") == KEY
+    assert s.read_account_credentials("1", s.account_email("1")) == backup
