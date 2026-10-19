@@ -20,6 +20,36 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_live_add_refuses_replacing_active_gateway(self, gateway_switcher):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        with pytest.raises(ConfigError, match="Switch away from the active gateway"):
+            s.add_account(slot=2, assume_yes=True)
+        assert s.gateway_credential("2") == KEY
+
+    @pytest.mark.parametrize("operation", ["purge", "add-token", "add"])
+    def test_gateway_activation_during_confirmation_refuses_deletion(
+        self, gateway_switcher, monkeypatch, operation
+    ):
+        s = gateway_switcher
+        seed_oauth(s)
+
+        def confirm(*args):
+            s.switch_to("2", json_output=True)
+            return "y"
+
+        monkeypatch.setattr("builtins.input", confirm)
+        with pytest.raises(ConfigError, match="Switch away from the active gateway"):
+            if operation == "purge":
+                s.purge()
+            elif operation == "add":
+                s.add_account(slot=2)
+            else:
+                s.add_account_from_token(KEY, base_url="https://other.example", slot=2, email="other@example.com")
+        assert s.current_account_number() == "2"
+        assert s.gateway_credential("2") == KEY
+
     @pytest.mark.parametrize("contents", ["{broken", '{"env": []}'])
     def test_malformed_gateway_settings_raises_switch_error(self, gateway_switcher, contents):
         s = gateway_switcher
