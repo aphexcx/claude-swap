@@ -4039,7 +4039,10 @@ class ClaudeAccountSwitcher:
         except ValueError as exc:
             raise ValidationError(str(exc)) from None
         if alias is not None:
-            alias = normalize_alias(alias)
+            try:
+                alias = normalize_alias(alias)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from None
         is_api_key = looks_like_api_key(token) or bool(gateway_fields)
 
         if email and not self._validate_email(email):

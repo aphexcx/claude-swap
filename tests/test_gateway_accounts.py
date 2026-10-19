@@ -229,3 +229,17 @@ def test_forced_import_refuses_active_gateway_replacement(gateway_switcher, temp
     assert s._gateway_settings_path().read_bytes() == settings
     assert s._read_account_credentials("1", row["email"]) == credentials
     assert s.gateway_credential("1") == KEY
+
+
+def test_add_token_numeric_alias_is_validation_error(gateway_switcher, monkeypatch, capsys):
+    with pytest.raises(ValidationError):
+        gateway_switcher.add_account_from_token(KEY, base_url="https://gateway.example", alias="123")
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: gateway_switcher)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(KEY + "\n"))
+    monkeypatch.setattr(sys, "argv", ["cswap", "add-token", "-", "--base-url", "https://gateway.example", "--alias", "123"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "Error:" in output.err + output.out
+    assert "Traceback" not in output.err + output.out
