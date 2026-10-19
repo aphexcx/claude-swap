@@ -19,6 +19,31 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_return_keeps_oauth_backup_rotated_while_gateway_active(
+        self, gateway_switcher
+    ):
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s._get_sequence_data()["accounts"]["1"]["email"]
+        original = json.loads(s._read_account_credentials("1", email))
+        original["claudeAiOauth"].update(
+            accessToken="old-access", refreshToken="old-refresh", expiresAt=1000
+        )
+        s._write_account_credentials("1", email, json.dumps(original))
+        s.switch_to("1", force=True, json_output=True)
+        s.switch_to("2", json_output=True)
+        refreshed = json.loads(json.dumps(original))
+        refreshed["claudeAiOauth"].update(
+            accessToken="new-access", refreshToken="new-refresh", expiresAt=2000
+        )
+        s._write_account_credentials("1", email, json.dumps(refreshed))
+
+        s.switch_to("1", json_output=True)
+
+        assert json.loads(s._read_account_credentials("1", email)) == refreshed
+        assert json.loads(get_credentials_path().read_text()) == refreshed
+        assert s.current_account_number() == "1"
+
     def test_activation_and_return_preserve_saved_login(self, gateway_switcher):
         s = gateway_switcher
         seed_oauth(s)
