@@ -35,6 +35,42 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("status,extra,enabled,target_state,second,expected", [
+        ("exhausted", {}, True, "usable", 100, 4),
+        ("unauthorized", {}, True, "usable", 100, 4),
+        ("cooling", {"coolingSince": 999000}, True, "usable", 100, 4),
+        ("transient", {"transientSince": 999000}, True, "usable", 100, 4),
+        ("ok", {}, True, "usable", 100, 3),
+        ("cooling", {"coolingSince": 1000000}, True, "usable", 100, 3),
+        ("exhausted", {}, False, "usable", 100, 3),
+        ("exhausted", {}, True, "disabled", 100, 3),
+        ("exhausted", {}, True, "quarantined", 100, 3),
+        ("exhausted", {}, True, "usable", 10, 2),
+    ])
+    def test_failed_gateway_honors_api_key_fallback(
+        self, temp_home, monkeypatch, status, extra, enabled, target_state, second, expected,
+    ):
+        from dataclasses import replace
+
+        h = fleet(temp_home, monkeypatch)
+        h.engine.settings = replace(h.settings, include_api_key_accounts=enabled)
+        h.switcher.add_account_from_token("sk-ant-api03-" + KEY, slot=4)
+        h.switcher.switch_to("3", json_output=True)
+        if target_state == "disabled":
+            h.switcher.set_account_disabled("4", True)
+        elif target_state == "quarantined":
+            h.engine._quarantine("4", h.switcher.account_email("4"), "invalid_grant")
+        if expected != 2:
+            monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        entries = readings(h, second=second, status=status, **extra)
+        entries["4"] = UsageEntry(sentinel="api key")
+        outcome = h.tick_with_entries(entries)
+        assert h.active_number() == expected
+        if expected != 3:
+            assert outcome == TickOutcome.SWITCHED
+            assert gateway.active_slot(h.switcher._gateway_settings_path(), h.switcher._get_sequence_data()["accounts"]) is None
+            assert "apiKeyHelper" not in gateway.read_settings(h.switcher._gateway_settings_path())
+
     def test_mixed_gateway_failures_share_departure_grace(self, temp_home, monkeypatch):
         from tests.test_gateway_probe import respond
 
