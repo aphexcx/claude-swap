@@ -1290,6 +1290,38 @@ def capture_exec(monkeypatch):
 
 
 class TestRun:
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_oauth_session_isolated_from_default_gateway(
+        self, manager, capture_exec, auth_status_tracks_seed, refresh_rotates,
+        monkeypatch, temp_home, existing,
+    ):
+        from claude_swap import gateway
+        from tests.test_gateway_accounts import KEY
+
+        monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+        settings = temp_home / ".claude" / "settings.json"
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(json.dumps({"theme": "dark", "env": {"KEEP": "yes"}}))
+        profile = session_dir_for(manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        if existing:
+            manager.setup_session("2", share=True)
+            assert (profile / "settings.json").is_symlink()
+        manager.switcher.add_account_from_token(
+            KEY, base_url="https://gateway.example", slot=7, model_discovery=True
+        )
+        manager.switcher.switch_to("7", json_output=True)
+        if existing:
+            # An already-running OAuth profile must be insulated immediately.
+            assert not (profile / "settings.json").is_symlink()
+            assert "apiKeyHelper" not in json.loads((profile / "settings.json").read_text())
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [])
+        data = json.loads((profile / "settings.json").read_text())
+        assert "apiKeyHelper" not in data
+        assert data["env"] == {"KEEP": "yes", "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL}
+        assert data["theme"] == "dark"
+        assert json.loads(settings.read_text())["apiKeyHelper"] == gateway.helper("7")
+
     def test_claude_not_on_path(self, manager, monkeypatch):
         monkeypatch.setattr(session_mod.shutil, "which", lambda name: None)
         with pytest.raises(SessionError, match="not found on PATH"):

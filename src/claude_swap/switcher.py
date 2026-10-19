@@ -7126,6 +7126,19 @@ class ClaudeAccountSwitcher:
         )
         transaction.record_step("settings_written")
         try:
+            if is_gateway:
+                # Existing OAuth sessions may still share settings via a
+                # symlink from before any gateway was added. Detach their
+                # auth settings before changing the default login, including
+                # profiles currently in use. Credential files stay untouched.
+                from claude_swap.session import SessionManager
+
+                manager = SessionManager(self)
+                for num, record in accounts.items():
+                    manager._isolate_auth_settings(
+                        self._session_dir(num, record["email"]),
+                        gateway_session=record.get("kind") == "gateway",
+                    )
             gateway.write_settings(path, target if is_gateway else None, target_record)
             yield {"from": from_ref}
         except Exception:
