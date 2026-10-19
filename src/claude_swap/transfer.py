@@ -20,10 +20,12 @@ from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
     TransferError,
+    ValidationError,
 )
 from claude_swap.fsutil import atomic_write_text
 from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
 
@@ -467,8 +469,13 @@ def import_accounts(
     # Pass 2: writes. Validation is complete; remaining failures (disk I/O,
     # keyring) are environmental and don't reflect on the file's integrity.
     switcher._setup_directories()
-    switcher._init_sequence_file()
+    with FileLock(switcher.lock_file):
+        switcher._init_sequence_file()
+        _import_accounts_locked(switcher, envelope, normalized, force)
 
+
+def _import_accounts_locked(switcher, envelope, normalized, force):
+    """Keep replacement validation and all writes under the roster lock."""
     imported = 0
     skipped = 0
     overwritten = 0
@@ -562,6 +569,10 @@ def import_accounts(
                 target_num = str(switcher._get_next_account_number())
             outcome = "imported"
 
+        try:
+            switcher._refuse_active_gateway_replacement(data, target_num)
+        except ConfigError as exc:
+            raise ValidationError(str(exc)) from None
         switcher._write_account_credentials(
             target_num, entry["email"], entry["creds_text"]
         )
