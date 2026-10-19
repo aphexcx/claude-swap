@@ -3177,7 +3177,6 @@ def test_gateway_malformed_base_url_names_settings_file(share_setup, value):
 
 
 def test_gateway_launch_snapshots_endpoint_and_key_together(manager, capture_exec, monkeypatch):
-    from claude_swap import gateway
     from claude_swap.locking import FileLock
     from tests.test_gateway_accounts import KEY
 
@@ -3242,5 +3241,20 @@ def test_gateway_generated_settings_adopt_later_shared_source(manager, temp_home
     manager.setup_session("7", share=True)
     assert json.loads((profile / "settings.json").read_text())["theme"] == "later"
     manager.setup_session("7", share=False)
-    assert "theme" not in json.loads((profile / "settings.json").read_text())
+    assert not (profile / "settings.json").exists()
     assert not (profile / SHARE_MANIFEST).exists()
+
+
+@pytest.mark.parametrize("initial_share", [False, True])
+def test_gateway_settings_resume_sharing_after_no_share(manager, temp_home, initial_share):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"original"}')
+    manager.setup_session("7", share=initial_share)
+    manager.setup_session("7", share=False)
+    source.write_text('{"theme":"resumed"}')
+    profile, _, _ = manager.setup_session("7", share=True)
+    assert json.loads((profile / "settings.json").read_text())["theme"] == "resumed"
+    assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
