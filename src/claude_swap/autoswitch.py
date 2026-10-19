@@ -1655,16 +1655,8 @@ class AutoSwitchEngine:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
                 return self._perform(num, email, trigger, left_snapshot)
-            status = self._freshen_target(num, email)
-            if status == "identity-conflict":
-                # The slot's credential is alive but belongs to a different
-                # account — switching onto it would silently run the wrong
-                # account. Quarantine (auto-released once a re-add replaces
-                # the credential).
-                self._quarantine(num, email, "identity-conflict")
-                continue
-            if status == "invalid_grant":
-                self._quarantine(num, email, "invalid_grant")
+            status = self._prepare_target(num, email)
+            if status in ("identity-conflict", "invalid_grant"):
                 continue
             if status == "transient":
                 transient_failure = True
@@ -1699,6 +1691,15 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    def _prepare_target(self, number: str, email: str) -> str:
+        """Persist quarantine for a failed freshen on every rotation path."""
+        status = self._freshen_target(number, email)
+        if status in ("identity-conflict", "invalid_grant"):
+            # Freshening may already have persisted a foreign successor.
+            # Fingerprint that generation so it stays excluded next tick.
+            self._quarantine(number, email, status)
+        return status
 
     @staticmethod
     def _gateway_eligible(entry, threshold: float) -> bool:
@@ -1790,10 +1791,30 @@ class AutoSwitchEngine:
                 if self.switcher.account_kind_for(n) == "gateway"
                 and self._gateway_eligible(entries.get(n), thresholds[n])
             ]
+        transient_failure = False
+        systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if self.dry_run or self._freshen_target(num, email) == "ok":
+            if self.dry_run:
                 return self._perform(num, email, trigger, (None, float("inf")))
+            status = self._prepare_target(num, email)
+            if status in ("identity-conflict", "invalid_grant", "skip-live-session"):
+                continue
+            if status == "transient":
+                transient_failure = True
+                continue
+            if status in _SYSTEMIC_STATUSES:
+                if not systemic or _SYSTEMIC_STATUSES.index(status) < _SYSTEMIC_STATUSES.index(systemic):
+                    systemic = status
+                continue
+            return self._perform(num, email, trigger, (None, float("inf")))
+        if systemic or transient_failure:
+            self._emit(ErrorEvent(
+                message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
+                if systemic else "could not freshen any candidate (network?)",
+                transient=True,
+            ))
+            return TickOutcome.ERROR
         self._emit(
             NoSwitchEvent(
                 reason=failure or "gateway-hold",

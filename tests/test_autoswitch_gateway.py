@@ -203,3 +203,27 @@ def test_gateway_recovered_oauth_waits_until_gateway_says_no(temp_home, monkeypa
     assert h.active_number() == 3
     assert h.tick_with_entries(readings(h, second=10, status="exhausted")) == TickOutcome.SWITCHED
     assert h.active_number() == 2
+
+
+@pytest.mark.parametrize("reason", ["identity-conflict", "invalid_grant"])
+def test_gateway_return_quarantine_survives_second_tick(temp_home, monkeypatch, reason):
+    import json
+    from claude_swap import oauth
+
+    h = fleet(temp_home, monkeypatch)
+    h.switcher.switch_to("3", json_output=True)
+    h.seed(2, "two@example.com", expires_at=0)
+    monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+    fresh = json.dumps({"claudeAiOauth": {
+        "accessToken": "foreign-access", "refreshToken": "foreign-refresh",
+        "expiresAt": 99_999_999_999_000,
+    }})
+    result = (oauth.RefreshOutcome(fresh, None, {"uuid": "foreign-uuid", "email": "foreign@example.com", "organizationUuid": ""})
+              if reason == "identity-conflict" else oauth.RefreshOutcome(None, "invalid_grant"))
+    refresh = Mock(return_value=result)
+    monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+    assert h.tick_with_entries(readings(h, second=10, status="exhausted")) == TickOutcome.BLOCKED
+    assert h.tick_with_entries(readings(h, second=10, status="exhausted")) == TickOutcome.BLOCKED
+    assert h.active_number() == 3
+    assert h.state()["quarantine"]["2"]["reason"] == reason
+    assert refresh.call_count == 1
