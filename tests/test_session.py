@@ -3140,3 +3140,25 @@ def test_gateway_isolation_removes_registered_gateway_url(share_setup):
     assert json.loads(path.read_text())["env"] == {
         "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL, "KEEP": "yes",
     }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="legacy symlink profile is POSIX-only")
+def test_gateway_activation_prunes_dangling_oauth_settings_link(manager, temp_home, monkeypatch):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.unlink(missing_ok=True)
+    profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    profile.mkdir(parents=True, exist_ok=True)
+    path = profile / "settings.json"
+    path.symlink_to(source)
+    s.switch_to("7", json_output=True)
+    assert not path.is_symlink()
+    settings = json.loads(path.read_text()) if path.exists() else {}
+    assert "apiKeyHelper" not in settings
+    assert settings.get("env", {}).get("ANTHROPIC_BASE_URL") != "https://gateway.example"
+    assert json.loads(source.read_text())["apiKeyHelper"] == gateway.helper("7")

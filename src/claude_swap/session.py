@@ -1112,6 +1112,8 @@ class SessionManager:
         path = session_dir / "settings.json"
         source = source or path
         if not source.exists() and not (gateway_session and session_dir.is_dir()):
+            if path.is_symlink():
+                path.unlink()
             return
         try:
             settings = gateway.read_settings(source)
@@ -1207,6 +1209,8 @@ class SessionManager:
                         # Keep ownership while the source is absent, so a
                         # later launch can restore the managed copy.
                         new_managed.append(name)
+                    elif dest.is_symlink():
+                        dest.unlink()
                     continue
                 # Keep shared customizations as a copy. Linking would let a
                 # later default gateway switch change this session's auth.
