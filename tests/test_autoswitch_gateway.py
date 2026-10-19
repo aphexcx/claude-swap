@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import pytest
 
 from claude_swap import gateway
-from claude_swap.autoswitch import ConfigWarningEvent, SwitchEvent, TickOutcome
+from claude_swap.autoswitch import AutoSwitchEngine, ConfigWarningEvent, SwitchEvent, TickOutcome
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from tests.test_autoswitch import EngineHarness, _entry_for, _usage
 from tests.test_gateway_accounts import KEY
@@ -35,6 +35,19 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    def test_gateway_fallback_after_live_oauth_candidate_skipped(
+        self, temp_home, monkeypatch, strategy
+    ):
+        h = fleet(temp_home, monkeypatch, strategy=strategy)
+        monkeypatch.setattr(
+            h.engine, "_freshen_target",
+            AutoSwitchEngine._freshen_target.__get__(h.engine),
+        )
+        monkeypatch.setattr(h.switcher, "live_session_pids_for", lambda n, email: [123] if n == "2" else [])
+        assert h.tick_with_entries(readings(h, second=10)) == TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     @pytest.mark.parametrize("second", [10, 85])
     def test_gateway_only_after_qualifying_oauth(
