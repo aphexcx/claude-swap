@@ -7570,7 +7570,8 @@ class ClaudeAccountSwitcher:
             # live login from the stored backup. In all cases, skip the
             # back-up-current step: it would either write account-None-*
             # backups or (force) poison the stored backup with stale creds.
-            if force_activate or current_identity is None or current_account is None:
+            missing_gateway_login = gateway_switch is not None and self._read_credentials() == ""
+            if force_activate or current_identity is None or current_account is None or missing_gateway_login:
                 # Account left: None on a fresh machine (no live account at
                 # all); an unnumbered ref for an unmanaged live account (slot
                 # unknown to cswap); a numbered ref when --force ran with a

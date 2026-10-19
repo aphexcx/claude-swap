@@ -372,3 +372,19 @@ def test_gateway_return_resolves_foreign_live_owner_without_cached_verdict(gatew
     s.switch_to("1", json_output=True)
     assert s.read_account_credentials("1", email) == backup
     assert any(s._store._read_unclaimed_credential(n)[0] == foreign for n in s.list_unclaimed_credentials())
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_gateway_return_restores_backup_after_live_login_missing(gateway_switcher, missing):
+    s = gateway_switcher
+    seed_oauth(s)
+    backup = s.read_account_credentials("1", s.account_email("1"))
+    if missing:
+        get_credentials_path().unlink()
+    else:
+        get_credentials_path().write_text("")
+    s.switch_to("2", json_output=True)
+    s.switch_to("1", json_output=True)
+    assert s.current_account_number() == "1"
+    assert s.read_account_credentials("1", s.account_email("1")) == backup
+    assert json.loads(get_credentials_path().read_text()) == json.loads(backup)
