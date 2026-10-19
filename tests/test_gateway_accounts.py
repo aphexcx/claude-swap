@@ -203,3 +203,29 @@ class TestGatewayAccounts:
         s.switch_to("1", json_output=True)
         cli.main()
         assert capsys.readouterr() == (KEY, "")
+
+
+@pytest.mark.parametrize("replacement", ["url", "kind"])
+def test_forced_import_refuses_active_gateway_replacement(gateway_switcher, temp_home, replacement):
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=1)
+    s.switch_to("1", json_output=True)
+    path = temp_home / "gateway-export.json"
+    export_accounts(s, str(path))
+    envelope = json.loads(path.read_text())
+    row = envelope["accounts"][0]
+    if replacement == "url":
+        row["baseUrl"] = "https://other.example"
+    else:
+        row["kind"] = "oauth"
+        row["credentials"] = {"claudeAiOauth": {"accessToken": "import-access", "refreshToken": "import-refresh"}}
+    path.write_text(json.dumps(envelope))
+    sequence = s.sequence_file.read_bytes()
+    settings = s._gateway_settings_path().read_bytes()
+    credentials = s._read_account_credentials("1", row["email"])
+    with pytest.raises(ValidationError, match="Switch away from the active gateway"):
+        import_accounts(s, str(path), force=True)
+    assert s.sequence_file.read_bytes() == sequence
+    assert s._gateway_settings_path().read_bytes() == settings
+    assert s._read_account_credentials("1", row["email"]) == credentials
+    assert s.gateway_credential("1") == KEY
