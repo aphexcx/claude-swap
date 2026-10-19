@@ -3810,7 +3810,9 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
+            expected_record = seq.get("accounts", {}).get(account_num)
             with FileLock(self.lock_file):
+                self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
                 self._write_account_credentials(account_num, current_email, current_creds)
@@ -3935,7 +3937,13 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
+        expected_records = {
+            account_num: data.get("accounts", {}).get(account_num) if slot is not None else None
+        }
+        if migrate_from:
+            expected_records[migrate_from] = data.get("accounts", {}).get(migrate_from)
         with FileLock(self.lock_file):
+            self._validate_account_write_targets(expected_records)
             self._refuse_active_gateway_replacement(
                 self._get_sequence_data() or {}, account_num, migrate_from
             )
@@ -4123,7 +4131,9 @@ class ClaudeAccountSwitcher:
                     f"Existing account metadata for {email} is inconsistent"
                 )
             self._refuse_active_gateway_replacement(seq, account_num)
+            expected_record = seq.get("accounts", {}).get(account_num)
             with FileLock(self.lock_file):
+                self._validate_account_write_targets({account_num: expected_record})
                 seq = self._get_sequence_data()
                 self._refuse_active_gateway_replacement(seq, account_num)
                 self._write_account_credentials(account_num, email, credentials)
@@ -4197,7 +4207,13 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
+        expected_records = {
+            account_num: data.get("accounts", {}).get(account_num) if slot is not None else None
+        }
+        if migrate_from:
+            expected_records[migrate_from] = data.get("accounts", {}).get(migrate_from)
         with FileLock(self.lock_file):
+            self._validate_account_write_targets(expected_records)
             self._refuse_active_gateway_replacement(
                 self._get_sequence_data() or {}, account_num, migrate_from
             )
@@ -4258,6 +4274,12 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+
+    def _validate_account_write_targets(self, expected: dict) -> None:
+        """Validate pre-prompt/resolution records again under the roster lock."""
+        accounts = (self._get_sequence_data() or {}).get("accounts", {})
+        if any(accounts.get(num) != record for num, record in expected.items()):
+            raise ConfigError("Account changed while preparing replacement; retry")
 
     def _refuse_active_gateway_replacement(self, data: dict, *slots: str | None) -> None:
         active = gateway.active_slot(self._gateway_settings_path(), data.get("accounts", {}))
