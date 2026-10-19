@@ -7346,7 +7346,7 @@ class ClaudeAccountSwitcher:
                     )
             gateway.write_settings(path, target if is_gateway else None, target_record)
             yield {"from": from_ref, "data": data}
-        except Exception:
+        except Exception as exc:
             restored = transaction.rollback(self)
             try:
                 atomic_write_bytes(self.sequence_file, sequence_before)
@@ -7356,6 +7356,10 @@ class ClaudeAccountSwitcher:
                 raise SwitchError(
                     "Gateway switch failed and rollback was incomplete; "
                     "check Claude settings and the active account before retrying"
+                ) from None
+            if isinstance(exc, SessionError):
+                raise SwitchError(
+                    f"Gateway switch failed; previous settings restored. {exc}"
                 ) from None
             raise SwitchError(
                 "Gateway switch failed; previous settings restored"

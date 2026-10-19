@@ -3061,3 +3061,34 @@ def test_gateway_deleted_shared_settings_remain_managed(share_setup):
     assert json.loads((profile / "settings.json").read_text())["theme"] == "new-theme"
     manager._sync_sharing(profile, share=False)
     assert not (profile / "settings.json").exists()
+
+
+@pytest.mark.parametrize("operation", ["oauth-run", "gateway-activation"])
+def test_gateway_malformed_settings_report_file_without_traceback(
+    manager, monkeypatch, temp_home, auth_status_tracks_seed, refresh_rotates, capsys, operation,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    if operation == "oauth-run":
+        path = temp_home / ".claude" / "settings.json"
+        argv = ["cswap", "run", "2"]
+    else:
+        profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+        profile.mkdir(parents=True, exist_ok=True)
+        path = profile / "settings.json"
+        argv = ["cswap", "switch", "7"]
+    path.write_text("{broken")
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: s)
+    monkeypatch.setattr(sys, "argv", argv)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert str(path) in output.out + output.err
+    assert "Traceback" not in output.out + output.err
+    assert path.read_text() == "{broken"
