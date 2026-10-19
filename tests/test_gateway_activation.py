@@ -6,7 +6,8 @@ import sys
 import pytest
 
 from claude_swap import gateway
-from claude_swap.exceptions import SwitchError, ValidationError
+from claude_swap import cli
+from claude_swap.exceptions import ConfigError, SwitchError, ValidationError
 from claude_swap.paths import get_credentials_path, get_global_config_path
 from tests.test_gateway_accounts import KEY
 from tests.test_gateway_accounts import gateway_switcher as gateway_switcher
@@ -19,6 +20,40 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_purge_refuses_active_gateway(self, gateway_switcher, monkeypatch):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        settings = s._gateway_settings_path().read_bytes()
+        sequence = s.sequence_file.read_bytes()
+        monkeypatch.setattr("builtins.input", lambda *a: "y")
+        with pytest.raises(ConfigError, match="Switch away from the active gateway before purging"):
+            s.purge()
+        assert s.sequence_file.read_bytes() == sequence
+        assert s._gateway_settings_path().read_bytes() == settings
+        assert s.gateway_credential("2") == KEY
+
+    def test_gateway_helper_refuses_session_profile(self, gateway_switcher, monkeypatch, capsys):
+        s = gateway_switcher
+        seed_oauth(s)
+        s.switch_to("2", json_output=True)
+        email = s._get_sequence_data()["accounts"]["1"]["email"]
+        profile = s._session_dir("1", email)
+        profile.mkdir(parents=True)
+        # Simulate an older session profile still linked to default settings.
+        (profile / "settings.json").symlink_to(s._gateway_settings_path())
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda: s)
+        monkeypatch.setattr(sys, "argv", ["cswap", "gateway-credential", "2"])
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        output = capsys.readouterr()
+        assert output.out == ""
+        assert "session profile" in output.err
+        assert KEY not in output.err
+
     @pytest.mark.parametrize("first,second", [("claude-swap", "cswap"), ("cswap", "claude-swap")])
     def test_gateway_return_across_cli_aliases(self, gateway_switcher, monkeypatch, first, second):
         s = gateway_switcher
