@@ -45,7 +45,7 @@ class TestAutoswitchGateway:
         for index in range(12):
             respond(monkeypatch, 500 if index % 2 == 0 else 503)
             verdict = gateway.probe(record, KEY, now=h.clock(), previous=verdict)
-            entries = readings(h, second=85)
+            entries = readings(h, second=75)
             entries["3"] = UsageEntry(sentinel="gateway", gateway=verdict)
             outcome = h.tick_with_entries(entries)
             if outcome == TickOutcome.SWITCHED:
@@ -60,13 +60,13 @@ class TestAutoswitchGateway:
         assert h.tick_with_entries(readings(h, second=85)) == TickOutcome.NO_ACTION
         assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == ["gateway-hold"]
 
-    def test_persistent_transient_gateway_leaves_for_oauth_inside_band(self, temp_home, monkeypatch):
+    def test_persistent_transient_gateway_leaves_for_oauth_after_grace(self, temp_home, monkeypatch):
         h = fleet(temp_home, monkeypatch)
         h.switcher.switch_to("3", json_output=True)
         since = h.clock()
-        assert h.tick_with_entries(readings(h, second=85, status="transient", transientSince=since)) == TickOutcome.NO_ACTION
+        assert h.tick_with_entries(readings(h, second=75, status="transient", transientSince=since)) == TickOutcome.NO_ACTION
         h.clock.advance(601)
-        assert h.tick_with_entries(readings(h, second=85, status="transient", transientSince=since)) == TickOutcome.SWITCHED
+        assert h.tick_with_entries(readings(h, second=75, status="transient", transientSince=since)) == TickOutcome.SWITCHED
         assert h.active_number() == 2
         assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == ["gateway-transient"]
 
@@ -109,7 +109,6 @@ class TestAutoswitchGateway:
             ("exhausted", {}, "gateway-exhausted"),
             ("unauthorized", {}, "gateway-unauthorized"),
             ("cooling", {"coolingSince": 999000}, "gateway-cooling"),
-            ("ok", {}, "gateway-return"),
         ],
     )
     def test_departure_reasons(self, temp_home, monkeypatch, status, extra, reason):
@@ -120,7 +119,7 @@ class TestAutoswitchGateway:
         assert h.active_number() == 2
         assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == [reason]
 
-    def test_failed_gateway_can_escape_without_return_margin(
+    def test_failed_gateway_return_requires_margin_but_ignores_cooldown(
         self, temp_home, monkeypatch
     ):
         h = fleet(temp_home, monkeypatch)
@@ -128,8 +127,10 @@ class TestAutoswitchGateway:
         h.engine._mutate_state(lambda state: state.update(lastSwitchAt=h.clock()))
         assert (
             h.tick_with_entries(readings(h, second=85, status="exhausted"))
-            == TickOutcome.SWITCHED
+            == TickOutcome.BLOCKED
         )
+        assert h.active_number() == 3
+        assert h.tick_with_entries(readings(h, second=75, status="exhausted")) == TickOutcome.SWITCHED
         assert h.active_number() == 2
 
     def test_gateway_does_not_hide_oauth_model_warning(self, temp_home, monkeypatch):
@@ -140,7 +141,7 @@ class TestAutoswitchGateway:
         )
         assert any(isinstance(event, ConfigWarningEvent) for event in h.events)
 
-    def test_return_hysteresis_cooldown_and_all_exhausted(self, temp_home, monkeypatch):
+    def test_gateway_hold_and_failed_return_hysteresis_and_all_exhausted(self, temp_home, monkeypatch):
         h = fleet(temp_home, monkeypatch)
         h.switcher.switch_to("3", json_output=True)
         assert h.tick_with_entries(readings(h, second=81)) == TickOutcome.NO_ACTION
@@ -152,7 +153,7 @@ class TestAutoswitchGateway:
             h.tick_with_entries(readings(h, status="exhausted")) == TickOutcome.BLOCKED
         )
         assert h.active_number() == 3
-        assert h.tick_with_entries(readings(h, second=50)) == TickOutcome.SWITCHED
+        assert h.tick_with_entries(readings(h, second=50, status="exhausted")) == TickOutcome.SWITCHED
 
     def test_real_collector_probes_once_per_tick_at_gateway_cadence(
         self, temp_home, monkeypatch
@@ -192,3 +193,13 @@ class TestAutoswitchGateway:
         }
         h.tick_with_entries(data)
         assert h.active_number() != 3
+
+
+@pytest.mark.parametrize("strategy", ["best", "consume-first"])
+def test_gateway_recovered_oauth_waits_until_gateway_says_no(temp_home, monkeypatch, strategy):
+    h = fleet(temp_home, monkeypatch, strategy=strategy)
+    h.switcher.switch_to("3", json_output=True)
+    assert h.tick_with_entries(readings(h, second=10)) == TickOutcome.NO_ACTION
+    assert h.active_number() == 3
+    assert h.tick_with_entries(readings(h, second=10, status="exhausted")) == TickOutcome.SWITCHED
+    assert h.active_number() == 2

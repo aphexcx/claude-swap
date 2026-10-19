@@ -1682,6 +1682,9 @@ class AutoSwitchEngine:
             failure = "gateway-transient"
         elif verdict.get("budget") and verdict["budget"]["pct"] >= thresholds[current]:
             failure = "gateway-exhausted"
+        if not failure:
+            self._emit(NoSwitchEvent(reason="gateway-hold"))
+            return TickOutcome.NO_ACTION
         candidates = [
             n
             for n in self.switcher.switchable_account_numbers()
@@ -1695,11 +1698,11 @@ class AutoSwitchEngine:
                 usage.get(n),
                 thresholds[n],
                 settings,
-                margin=0.0 if failure else settings.hysteresis_pct,
+                margin=settings.hysteresis_pct,
             )
         ]
         ordered, _, _ = self._rank_candidates(
-            trigger="at-limit" if failure else "proactive",
+            trigger="at-limit",
             consume_first=settings.strategy == "consume-first",
             oauth_candidates=oauth_candidates,
             no_return=None,
@@ -1711,11 +1714,8 @@ class AutoSwitchEngine:
             now=self.clock(),
             thresholds=thresholds,
         )
-        trigger = failure or "gateway-return"
-        if not failure and self._in_cooldown(state):
-            self._emit(NoSwitchEvent(reason="cooldown"))
-            return TickOutcome.NO_ACTION
-        if failure and settings.include_gateway_accounts:
+        trigger = failure
+        if settings.include_gateway_accounts:
             ordered += [
                 n
                 for n in candidates
