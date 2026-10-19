@@ -314,6 +314,7 @@ class UsageEntry:
     # import-usage``) keeps every collector off this slot. Appended for the
     # same positional compatibility as ``claim_until``.
     held_until: float | None = None
+    gateway: dict | None = None
 
     def fresh(self, now: float, ttl: float = SERVE_TTL_S) -> bool:
         return self.fetched_at is not None and (now - self.fetched_at) <= ttl
@@ -974,10 +975,93 @@ class UsageStore:
                 trust_extended=trust_extended,
                 claim_until=claim_until,
                 held_until=held_until,
+                sentinel="gateway" if isinstance(row.get("gateway"), dict) else None,
+                gateway=row.get("gateway"),
             )
         return out
 
     # -- writes ---------------------------------------------------------------
+
+    def collect_gateway(
+        self,
+        num: str,
+        identity: Identity,
+        record: dict,
+        key: str,
+        *,
+        active: bool,
+        fetch: bool,
+    ) -> UsageEntry:
+        """Gateway-only lease and cadence; OAuth's reserve/record are untouched."""
+        import hashlib
+        from claude_swap import gateway
+
+        now = self.clock()
+        fingerprint = hashlib.sha256(
+            (key + json.dumps(record, sort_keys=True)).encode()
+        ).hexdigest()
+        claim = None
+        with self._lock():
+            rows = self._read_rows()
+            row = rows.get(num, {})
+            if (
+                not self._matches(row, identity)
+                or row.get("gatewayFingerprint") != fingerprint
+            ):
+                row = self._fresh_row(identity)
+            prior = row.get("gateway", {})
+            due = row.get("nextPollAt", 0)
+            if (
+                active
+                and not row.get("gatewayActive")
+                and prior.get("probeStatus") in ("ok", "transient")
+            ):
+                due = min(due, prior["probedAt"] + gateway.ACTIVE_INTERVAL_S)
+            if (
+                fetch
+                and key
+                and prior.get("probeStatus") != "unauthorized"
+                and now >= due
+                and now >= row.get("claimUntil", 0)
+            ):
+                claim = uuid.uuid4().hex
+                row.update(
+                    gatewayFingerprint=fingerprint,
+                    gatewayClaim=claim,
+                    claimUntil=now + CLAIM_TTL_S,
+                )
+                rows[num] = row
+                self._write_rows(rows)
+        if claim:
+            verdict = gateway.probe(record, key, now=now, previous=prior)
+            budget = gateway.usage(record, key)
+            if isinstance(budget, dict):
+                verdict["budget"] = budget
+            deadline = gateway.next_probe_at(verdict, active=active, now=now)
+            with self._lock():
+                rows = self._read_rows()
+                row = rows.get(num, {})
+                if (
+                    row.get("gatewayClaim") == claim
+                    and row.get("gatewayFingerprint") == fingerprint
+                ):
+                    row.update(
+                        sentinel="gateway",
+                        gateway=verdict,
+                        gatewayActive=active,
+                        nextPollAt=deadline,
+                        fetchedAt=now,
+                        lastAttemptAt=now,
+                    )
+                    row.pop("gatewayClaim", None)
+                    row.pop("claimUntil", None)
+                    rows[num] = row
+                    self._write_rows(rows)
+        entry = self.entries({num: identity})[num]
+        # A changed key must never inherit the preceding key's healthy verdict.
+        if self._read_rows().get(num, {}).get("gatewayFingerprint") != fingerprint:
+            return UsageEntry(sentinel="gateway")
+        return replace(entry, sentinel="gateway")
 
     def _mutate(
         self,

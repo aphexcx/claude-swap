@@ -1394,6 +1394,50 @@ class TestRun:
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
         assert exc.value.env["UNRELATED_VAR"] == "kept"
 
+    @pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+    def test_gateway_exec_env_without_oauth_bootstrap(
+        self,
+        manager,
+        capture_exec,
+        monkeypatch,
+        auth,
+        capsys,
+    ):
+        key = "gateway-session-dummy-secret"
+        manager.switcher.add_account_from_token(
+            key,
+            base_url="https://gateway.example",
+            auth=auth,
+            slot=7,
+            model_discovery=True,
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "unrelated-key")
+        monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "unrelated-token")
+        monkeypatch.setenv("UNRELATED_VAR", "kept")
+        monkeypatch.setattr(
+            manager, "_bootstrap", lambda *a, **kw: pytest.fail("OAuth bootstrap")
+        )
+        monkeypatch.setattr(
+            manager,
+            "_is_session_valid",
+            lambda *a, **kw: pytest.fail("OAuth auth-status probe"),
+        )
+        with pytest.raises(_ExecCalled) as exc:
+            manager.run("7", ["--model", "dummy"])
+        env = exc.value.env
+        chosen = "ANTHROPIC_AUTH_TOKEN" if auth == "bearer" else "ANTHROPIC_API_KEY"
+        other = "ANTHROPIC_API_KEY" if auth == "bearer" else "ANTHROPIC_AUTH_TOKEN"
+        assert env[chosen] == key and other not in env
+        assert env["ANTHROPIC_BASE_URL"] == "https://gateway.example"
+        assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
+        assert env["UNRELATED_VAR"] == "kept"
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        assert not (profile / ".credentials.json").exists()
+        assert key not in (profile / "settings.json").read_text()
+        out = capsys.readouterr().out
+        assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
+        assert key not in out
+
     def test_fast_path_keeps_env_untouched(
         self, manager, capture_exec, monkeypatch
     ):

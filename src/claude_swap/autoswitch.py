@@ -868,7 +868,7 @@ class AutoSwitchEngine:
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
-        if self.switcher.account_kind_for(number) == "api_key":
+        if self.switcher.account_kind_for(number) in ("api_key", "gateway"):
             return "ok"  # API keys don't expire/refresh
         if self.switcher.live_session_pids_for(number, email):
             # A live `cswap run` session owns this account's token in its own
@@ -1025,6 +1025,7 @@ class AutoSwitchEngine:
         values = [
             thresholds[num]
             for num in self.switcher.switchable_account_numbers()
+            if self.switcher.account_kind_for(num) != "gateway"
         ]
         return min(values) if values else self.settings.threshold
 
@@ -1226,6 +1227,18 @@ class AutoSwitchEngine:
             )
             return TickOutcome.NO_ACTION
 
+        if self.switcher.account_kind_for(current) == "gateway":
+            return self._tick_active_gateway(
+                current,
+                entries,
+                usage,
+                headroom,
+                thresholds,
+                settings,
+                state,
+                quarantined,
+            )
+
         active_headroom = headroom.get(current)
         active_binding: BindingWindow | None = None
         if active_headroom is not None:
@@ -1313,7 +1326,11 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in (
+            "proactive",
+            "consume-first",
+            "gateway-return",
+        ) and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1324,7 +1341,7 @@ class AutoSwitchEngine:
             if num != current and num not in quarantined
         ]
         oauth_candidates = [
-            n for n in candidates if self.switcher.account_kind_for(n) != "api_key"
+            n for n in candidates if self.switcher.account_kind_for(n) == "oauth"
         ]
         # The no-return bar itself lives in `_rank` below: it is a statement
         # about the CHOICE, so it belongs where the choice is made rather than
@@ -1335,6 +1352,17 @@ class AutoSwitchEngine:
             if settings.include_api_key_accounts
             else []
         )
+        gateway_candidates = (
+            [
+                n
+                for n in candidates
+                if self.switcher.account_kind_for(n) == "gateway"
+                and self._gateway_eligible(entries.get(n), thresholds[n])
+            ]
+            if settings.include_gateway_accounts
+            else []
+        )
+        api_key_candidates += gateway_candidates
         if (
             trigger == "consume-first"
             and not oauth_candidates
@@ -1469,7 +1497,7 @@ class AutoSwitchEngine:
             # threshold: a still-qualifying sooner target switches anyway,
             # and otherwise the next tick escalates normally and escapes.
             entries = self.switcher.usage_entries_by_account(
-                fetch={current, *candidates}
+                fetch={current, *oauth_candidates}
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
@@ -1488,6 +1516,14 @@ class AutoSwitchEngine:
                 thresholds=thresholds,
             )
 
+        if gateway_candidates and trigger != "consume-first":
+            # A healthy gateway is the fallback once OAuth seats reach their
+            # own lines; do not choose a nearly-spent OAuth recovery fallback.
+            ordered = [
+                n
+                for n in ordered
+                if self._gateway_oauth_eligible(usage.get(n), thresholds[n], settings)
+            ]
         if not ordered and api_key_candidates and trigger != "consume-first":
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
@@ -1658,6 +1694,124 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
         self._emit(NoSwitchEvent(reason="no-viable-target"))
         return TickOutcome.BLOCKED
+
+    @staticmethod
+    def _gateway_eligible(entry, threshold: float) -> bool:
+        verdict = entry.gateway if entry is not None else None
+        if not verdict or verdict.get("probeStatus") != "ok":
+            return False
+        budget = verdict.get("budget")
+        return budget is None or budget["pct"] < threshold
+
+    def _gateway_oauth_eligible(self, value, threshold, settings, margin=0.0) -> bool:
+        windows = oauth.relevant_windows(
+            value if isinstance(value, dict) else None, self._models
+        )
+        return bool(windows) and all(
+            pct < window_line(label, threshold, settings.weekly_threshold)
+            and pct <= window_line(label, threshold, settings.weekly_threshold) - margin
+            for label, pct, _ in windows
+        )
+
+    def _tick_active_gateway(
+        self,
+        current,
+        entries,
+        usage,
+        headroom,
+        thresholds,
+        settings,
+        state,
+        quarantined,
+    ):
+        from claude_swap import gateway
+
+        verdict = entries[current].gateway or {}
+        status = verdict.get("probeStatus")
+        failure = None
+        if status in ("exhausted", "unauthorized"):
+            failure = "gateway-" + status
+        elif (
+            status == "cooling"
+            and self.clock() - verdict.get("coolingSince", self.clock())
+            >= gateway.COOLING_MAX_S
+        ):
+            failure = "gateway-cooling"
+        elif verdict.get("budget") and verdict["budget"]["pct"] >= thresholds[current]:
+            failure = "gateway-exhausted"
+        candidates = [
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if n != current and n not in quarantined
+        ]
+        oauth_candidates = [
+            n
+            for n in candidates
+            if self.switcher.account_kind_for(n) == "oauth"
+            and self._gateway_oauth_eligible(
+                usage.get(n),
+                thresholds[n],
+                settings,
+                margin=0.0 if failure else settings.hysteresis_pct,
+            )
+        ]
+        ordered, _, _ = self._rank_candidates(
+            trigger="at-limit" if failure else "proactive",
+            consume_first=settings.strategy == "consume-first",
+            oauth_candidates=oauth_candidates,
+            no_return=None,
+            usage=usage,
+            headroom=headroom,
+            current=current,
+            active_headroom=None,
+            settings=settings,
+            now=self.clock(),
+            thresholds=thresholds,
+        )
+        trigger = failure or "gateway-return"
+        if not failure and self._in_cooldown(state):
+            self._emit(NoSwitchEvent(reason="cooldown"))
+            return TickOutcome.NO_ACTION
+        if failure and settings.include_gateway_accounts:
+            ordered += [
+                n
+                for n in candidates
+                if self.switcher.account_kind_for(n) == "gateway"
+                and self._gateway_eligible(entries.get(n), thresholds[n])
+            ]
+        for num in ordered:
+            email = self.switcher.account_email(num)
+            if self.dry_run or self._freshen_target(num, email) == "ok":
+                return self._perform(num, email, trigger, (None, float("inf")))
+        self._emit(
+            NoSwitchEvent(
+                reason=failure or "all-exhausted",
+                detail="no eligible OAuth account; holding gateway",
+            )
+        )
+        oauth_peers = [
+            n for n in candidates if self.switcher.account_kind_for(n) == "oauth"
+        ]
+        if (
+            failure
+            and oauth_peers
+            and all(
+                headroom.get(n) is not None and headroom[n] <= 0 for n in oauth_peers
+            )
+        ):
+            earliest = self._earliest_recovery(usage)
+            self._emit(
+                AllExhaustedEvent(
+                    earliest_reset_at=(
+                        earliest.isoformat().replace("+00:00", "Z")
+                        if earliest
+                        else None
+                    )
+                )
+            )
+            # Keep ticking: gateway cooling/retry cadence must not be parked
+            # until an OAuth reset hours away.
+        return TickOutcome.BLOCKED if failure else TickOutcome.NO_ACTION
 
     def _no_return_account(
         self,
@@ -2374,11 +2528,23 @@ class AutoSwitchEngine:
         candidates = [
             n
             for n in self.switcher.switchable_account_numbers()
-            if n != current and n not in quarantined
+            if n != current
+            and n not in quarantined
+            and self.switcher.account_kind_for(n) != "gateway"
         ]
+        gateway_slots = {
+            n
+            for n in self.switcher.switchable_account_numbers()
+            if self.switcher.account_kind_for(n) == "gateway"
+            and self.settings.include_gateway_accounts
+            and n not in quarantined
+        }
+        active_gateway = self.switcher.account_kind_for(current) == "gateway"
+        if active_gateway:
+            gateway_slots.add(current)
 
         pre = self.switcher.usage_entries_by_account(fetch=set())
-        plan: set[str] = set()
+        plan: set[str] = set(gateway_slots)
         active_pre = pre.get(current)
         # The active account is nominated when never fetched, poll-due per its
         # persisted plan, or (no plan yet) past the normal cadence floor. The
@@ -2449,9 +2615,13 @@ class AutoSwitchEngine:
                 active_value if isinstance(active_value, dict) else None, self._models
             )
         )
-        escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
-            or (active_headroom is not None and near_a_line)
+        escalate = (
+            not active_gateway
+            and bool(candidates)
+            and (
+                (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+                or (active_headroom is not None and near_a_line)
+            )
         )
         if escalate:
             escalation_fetch = {current, *candidates}
@@ -2511,7 +2681,11 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in (
+                "proactive",
+                "consume-first",
+                "gateway-return",
+            ) and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2603,7 +2777,7 @@ class AutoSwitchEngine:
             n
             for n in self.switcher.switchable_account_numbers()
             if n not in quarantined
-            and self.switcher.account_kind_for(n) != "api_key"
+            and self.switcher.account_kind_for(n) == "oauth"
         ]
         values = [usage.get(n) for n in relevant]
         readable = [v for v in values if isinstance(v, dict)]

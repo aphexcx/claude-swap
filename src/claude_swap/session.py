@@ -600,7 +600,7 @@ class SessionManager:
                 f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
                 "overriding it for this launch."
             )
-        else:
+        elif self.switcher._account_kind(account_num) != "gateway":
             # Same-account fast path: never create a second credential copy
             # for the account that is already the active default login —
             # two copies of one account can drift if the server rotates the
@@ -643,6 +643,24 @@ class SessionManager:
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+        record = (
+            (self.switcher._get_sequence_data() or {})
+            .get("accounts", {})
+            .get(account_num, {})
+        )
+        if record.get("kind") == "gateway":
+            key = self.switcher.read_account_credentials(account_num, email)
+            if not key:
+                raise SessionError("Gateway account has no stored credential")
+            env["ANTHROPIC_BASE_URL"] = record["baseUrl"]
+            env[
+                "ANTHROPIC_AUTH_TOKEN"
+                if record.get("auth", "bearer") == "bearer"
+                else "ANTHROPIC_API_KEY"
+            ] = key
+            env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+            if record.get("modelDiscovery"):
+                env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -703,6 +721,25 @@ class SessionManager:
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if self.switcher._account_kind(account_num) == "gateway":
+            from claude_swap import gateway
+
+            _mkdir_private(session_dir)
+            self._sync_sharing(session_dir, share, share_history)
+            # A default-login gateway helper/base URL must not override this
+            # session's explicit exec environment. Keep other customizations.
+            settings_path = session_dir / "settings.json"
+            settings = gateway.read_settings(settings_path)
+            settings.pop("apiKeyHelper", None)
+            for name in (
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+            ):
+                settings.get("env", {}).pop(name, None)
+            if settings_path.is_symlink():
+                settings_path.unlink()
+            gateway.atomic_bytes(settings_path, json.dumps(settings).encode())
+            return session_dir, account_num, email
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
