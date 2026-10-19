@@ -541,11 +541,25 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
-def _probe_env(session_dir: Path) -> dict[str, str]:
+def _scrub_gateway_overrides(env: dict[str, str], gateway_urls) -> dict[str, str]:
+    from claude_swap import gateway
+
+    url = env.get("ANTHROPIC_BASE_URL")
+    try:
+        url = gateway.validate_url(url, base=True) if url else None
+    except ValueError:
+        pass
+    if url in gateway_urls:
+        for name in (*AUTH_OVERRIDE_ENV_VARS, "ANTHROPIC_BASE_URL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"):
+            env.pop(name, None)
+    return env
+
+
+def _probe_env(session_dir: Path, gateway_urls=()) -> dict[str, str]:
     """Env for the auth-status probe: session config dir, auth overrides dropped."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
-    return env
+    return _scrub_gateway_overrides(env, gateway_urls)
 
 
 class SessionManager:
@@ -622,7 +636,7 @@ class SessionManager:
                         "default login — launching claude directly."
                     )
                 )
-                self._exec(claude_bin, claude_args, env=dict(os.environ))
+                self._exec(claude_bin, claude_args, env=_scrub_gateway_overrides(dict(os.environ), self._gateway_urls()))
 
         scrubbed = [v for v in AUTH_OVERRIDE_ENV_VARS if os.environ.get(v)]
         if scrubbed:
@@ -656,6 +670,8 @@ class SessionManager:
             env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
             if record.get("modelDiscovery"):
                 env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] = "1"
+        else:
+            _scrub_gateway_overrides(env, self._gateway_urls())
         self._exec(claude_bin, claude_args, env=env)
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
@@ -1023,7 +1039,7 @@ class SessionManager:
         try:
             result = subprocess.run(
                 [claude_bin, "auth", "status", "--json"],
-                env=_probe_env(session_dir),
+                env=_probe_env(session_dir, self._gateway_urls()),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
@@ -1097,6 +1113,13 @@ class SessionManager:
             for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
         )
 
+    def _gateway_urls(self) -> set[str]:
+        return {
+            record["baseUrl"]
+            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
+            if record.get("kind") == "gateway" and isinstance(record.get("baseUrl"), str)
+        }
+
     def _isolate_auth_settings(
         self, session_dir: Path, *, gateway_session: bool = False,
         source: Path | None = None,
@@ -1117,11 +1140,7 @@ class SessionManager:
                 f"Cannot read Claude settings file {source}; repair it before retrying"
             ) from None
         owned_helper = gateway.owned_slot(settings.get("apiKeyHelper")) is not None
-        gateway_urls = {
-            record.get("baseUrl")
-            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
-            if record.get("kind") == "gateway" and record.get("baseUrl")
-        }
+        gateway_urls = self._gateway_urls()
         base_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL")
         if base_url is not None and not isinstance(base_url, str):
             raise SessionError(
