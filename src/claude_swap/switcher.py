@@ -5651,6 +5651,8 @@ class ClaudeAccountSwitcher:
         # every real account carries a non-empty org, and the lookup would
         # return a blank entry whose token_dead() is always False.
         data = self._get_sequence_data() or {}
+        if data.get("accounts", {}).get(num, {}).get("kind") == "gateway":
+            return False
         org = (
             (data.get("accounts", {}).get(num) or {})
             .get("organizationUuid", "") or ""
@@ -5935,6 +5937,8 @@ class ClaudeAccountSwitcher:
         out: list[str] = []
         for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
             snum = str(num)
+            if data.get("accounts", {}).get(snum, {}).get("kind") == "gateway":
+                continue
             fp = oauth.credential_fingerprint(creds) if creds else None
             if fp:
                 other = by_fp.get(fp)
@@ -6052,7 +6056,10 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
-                    login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expires_at=(
+                        None if seq_data.get("accounts", {}).get(str(num), {}).get("kind") == "gateway"
+                        else oauth.login_expires_at_iso(creds)
+                    ),
                     gateway_info=(
                         gateway.json_fields(
                             seq_data["accounts"][str(num)], entry.gateway

@@ -38,6 +38,26 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("key", ["12345", "null", "true", "[]", '"opaque"',
+        '{"claudeAiOauth":{"accessToken":"opaque","refreshToken":"opaque-refresh","expiresAt":9999999999999}}'])
+    def test_gateway_json_shaped_keys_remain_opaque(self, gateway_switcher, temp_home, capsys, key):
+        s = gateway_switcher
+        for num in [1, 2]:
+            s.add_account_from_token(key, slot=num, base_url="https://gateway.example")
+        s.switch_to("1", json_output=True)
+        payload = s.list_accounts(json_output=True)
+        assert all("loginExpiresAt" not in row for row in payload["accounts"])
+        assert not payload.get("duplicateAccountWarnings")
+        s.list_accounts()
+        s.status(json_output=True)
+        assert "Traceback" not in capsys.readouterr().err
+        path = temp_home / "opaque-export.json"
+        export_accounts(s, str(path))
+        sequence = s.sequence_file.read_bytes()
+        import_accounts(s, str(path))
+        assert s.sequence_file.read_bytes() == sequence
+        assert s.gateway_credential("1") == key
+
     def test_gateway_replaced_by_oauth_clears_cache_and_polls(
         self, gateway_switcher, monkeypatch
     ):
