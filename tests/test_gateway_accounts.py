@@ -312,3 +312,34 @@ def test_gateway_export_snapshots_endpoint_and_key_together(gateway_switcher, te
         ("https://old.example", KEY), ("https://new.example", KEY + "-replacement"),
     ]
 
+
+@pytest.mark.parametrize("failure", ["malformed", "write"])
+def test_last_gateway_remove_settings_failure_is_cli_error(gateway_switcher, monkeypatch, capsys, failure):
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=1)
+    path = s._gateway_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"env":' if failure == "malformed" else '{}')
+    before = path.read_bytes()
+    sequence = s.sequence_file.read_bytes()
+    email = s.account_email("1")
+    credentials = s._read_account_credentials("1", email)
+    if failure == "write":
+        def fail(*args, **kwargs):
+            raise OSError(KEY)
+        monkeypatch.setattr(gateway, "write_settings", fail)
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: s)
+    monkeypatch.setattr("builtins.input", lambda *args: "y")
+    monkeypatch.setattr(sys, "argv", ["cswap", "--remove-account", "1"])
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    output = capsys.readouterr()
+    assert "Error:" in output.err + output.out
+    assert str(path) in output.err + output.out
+    assert "Traceback" not in output.err + output.out
+    assert KEY not in output.err + output.out
+    assert s.sequence_file.read_bytes() == sequence
+    assert path.read_bytes() == before
+    assert s._read_account_credentials("1", email) == credentials
