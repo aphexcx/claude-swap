@@ -332,7 +332,11 @@ def next_probe_at(verdict: dict, *, active: bool, now: float) -> float | None:
     if status == "exhausted":
         interval = EXHAUSTED_INTERVAL_S
     elif status == "cooling":
-        interval = COOLING_INTERVAL_S
+        # The probe computes exponential backoff. Respect that deadline;
+        # jitter may spread retries later, never consume the grant early.
+        retry_at = verdict.get("retryAt")
+        interval = max(0, retry_at - now) if retry_at is not None else COOLING_INTERVAL_S
+        return now + interval * random.uniform(1, 1 + JITTER_FRAC)
     deadline = now + interval * random.uniform(1 - JITTER_FRAC, 1 + JITTER_FRAC)
     if status == "exhausted":
         deadline = min(deadline, max(now, verdict.get("retryAt") or now) + 60)

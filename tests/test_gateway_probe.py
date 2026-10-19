@@ -34,6 +34,29 @@ def respond(monkeypatch, status, message="", retry=None):
 
 
 class TestGatewayProbe:
+    @pytest.mark.parametrize("status", [503, 529])
+    def test_cooling_collection_obeys_growing_retry_deadline(self, temp_home, monkeypatch, status):
+        now = [1000.0]
+        store = UsageStore(temp_home / "cache", clock=lambda: now[0])
+        monkeypatch.setattr(gateway, "JITTER_FRAC", 0)
+        record = gateway.account_fields("https://gateway.example")
+
+        def collect():
+            return store.collect_gateway(
+                "1", ("gateway@example.com", ""), record, KEY, active=True, fetch=True
+            )
+
+        for delay in (60, 120, 240, 480, 600, 600):
+            opener = respond(monkeypatch, status)
+            entry = collect()
+            assert opener.open.call_count == 1
+            assert entry.next_poll_at == now[0] + delay
+            assert entry.next_poll_at == entry.gateway["retryAt"]
+            now[0] += delay - 1
+            collect()
+            assert opener.open.call_count == 1
+            now[0] += 1
+
     @pytest.mark.parametrize("reset", ["clear_dead_token", "record"])
     def test_oauth_cache_write_clears_prior_gateway_state(self, temp_home, monkeypatch, reset):
         store = UsageStore(temp_home / "cache", clock=lambda: 1000.0)
