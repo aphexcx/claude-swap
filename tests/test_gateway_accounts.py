@@ -445,3 +445,25 @@ def test_gateway_roster_initialization_holds_lock(gateway_switcher, monkeypatch)
     monkeypatch.setattr(s, "_write_json", racing_write)
     s._init_sequence_file()
     assert attempted == [False] or "1" in s._get_sequence_data()["accounts"]
+
+
+def test_gateway_add_token_rechecks_identity_after_slot_swap(gateway_switcher, monkeypatch):
+    from claude_swap.exceptions import ConfigError
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://a.example", slot=1, email="a@example.com")
+    s.add_account_from_token(KEY + "-b", base_url="https://b.example", slot=2, email="b@example.com")
+    check = s._refuse_active_gateway_replacement
+    swapped = []
+    def race(data, *slots):
+        check(data, *slots)
+        if not swapped:
+            swapped.append(True)
+            s.swap_accounts("1", "2")
+    monkeypatch.setattr(s, "_refuse_active_gateway_replacement", race)
+    with pytest.raises(ConfigError, match="changed|retry"):
+        s.add_account_from_token(KEY + "-new", base_url="https://new.example", email="a@example.com")
+    row, key = s.account_auth_snapshot("1", "b@example.com")
+    assert (row["baseUrl"], key) == ("https://b.example", KEY + "-b")
+    row, key = s.account_auth_snapshot("2", "a@example.com")
+    assert (row["baseUrl"], key) == ("https://a.example", KEY)
