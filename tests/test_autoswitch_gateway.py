@@ -35,6 +35,24 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("failure", ["skip-live-session", "transient", "identity-conflict"])
+    def test_oauth_freshening_failure_tries_api_key_before_gateway(self, temp_home, monkeypatch, failure):
+        from dataclasses import replace
+
+        h = fleet(temp_home, monkeypatch)
+        h.engine.settings = replace(h.settings, include_api_key_accounts=True)
+        h.switcher.add_account_from_token("sk-ant-api03-" + KEY, slot=4)
+        attempted = []
+        def freshen(num, email):
+            attempted.append(num)
+            return failure if num == "2" else "ok"
+        monkeypatch.setattr(h.engine, "_freshen_target", freshen)
+        entries = readings(h, second=10)
+        entries["4"] = UsageEntry(sentinel="api key")
+        assert h.tick_with_entries(entries) == TickOutcome.SWITCHED
+        assert attempted == ["2", "4"]
+        assert h.active_number() == 4
+
     def test_gateway_promotion_publishes_active_probe_deadline(self, temp_home, monkeypatch):
         from dataclasses import replace
 
