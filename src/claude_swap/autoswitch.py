@@ -1742,6 +1742,12 @@ class AutoSwitchEngine:
             >= gateway.COOLING_MAX_S
         ):
             failure = "gateway-cooling"
+        elif (
+            status == "transient"
+            and self.clock() - verdict.get("transientSince", self.clock())
+            >= gateway.TRANSIENT_MAX_S
+        ):
+            failure = "gateway-transient"
         elif verdict.get("budget") and verdict["budget"]["pct"] >= thresholds[current]:
             failure = "gateway-exhausted"
         candidates = [

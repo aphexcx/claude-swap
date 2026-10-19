@@ -35,6 +35,16 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_persistent_transient_gateway_leaves_for_oauth_inside_band(self, temp_home, monkeypatch):
+        h = fleet(temp_home, monkeypatch)
+        h.switcher.switch_to("3", json_output=True)
+        since = h.clock()
+        assert h.tick_with_entries(readings(h, second=85, status="transient", transientSince=since)) == TickOutcome.NO_ACTION
+        h.clock.advance(601)
+        assert h.tick_with_entries(readings(h, second=85, status="transient", transientSince=since)) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == ["gateway-transient"]
+
     @pytest.mark.parametrize("strategy", ["best", "consume-first"])
     def test_gateway_fallback_after_live_oauth_candidate_skipped(
         self, temp_home, monkeypatch, strategy
