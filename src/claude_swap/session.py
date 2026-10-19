@@ -55,6 +55,7 @@ from claude_swap.exceptions import (
     SessionError,
 )
 from claude_swap.fsutil import atomic_write_text
+from claude_swap.gateway import AUTH_OVERRIDE_ENV_VARS
 from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.paths import get_default_global_config_path
@@ -189,13 +190,6 @@ def mark_session_stale(session_dir: Path) -> bool:
 # warning: `cswap run N` is an explicit request for account N, so letting an
 # exported API key silently hijack the session would defeat the command. The
 # same-account fast path (plain claude, untouched env) does not scrub.
-AUTH_OVERRIDE_ENV_VARS = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
-)
 
 # `claude auth status` is a local check (no API call) but spawns the full CLI.
 _AUTH_STATUS_TIMEOUT = 10.0
@@ -1153,6 +1147,8 @@ class SessionManager:
         if gateway_session or owned_helper:
             settings.pop("apiKeyHelper", None)
         env = settings.setdefault("env", {})
+        for name in AUTH_OVERRIDE_ENV_VARS:
+            env.pop(name, None)
         if gateway_session or owned_helper or gateway_url:
             env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
         if gateway_session:

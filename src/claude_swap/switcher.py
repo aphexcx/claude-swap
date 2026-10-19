@@ -7336,6 +7336,8 @@ class ClaudeAccountSwitcher:
             self._read_target_credentials(target, target_record["email"])
         try:
             parsed = gateway.read_settings(path)
+            if is_gateway:
+                gateway.refuse_auth_overrides(parsed, path)
         except ValueError as exc:
             raise SwitchError(str(exc)) from None
         if (

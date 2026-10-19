@@ -3259,3 +3259,23 @@ def test_gateway_settings_resume_sharing_after_no_share(manager, temp_home, init
     profile, _, _ = manager.setup_session("7", share=True)
     assert json.loads((profile / "settings.json").read_text())["theme"] == "resumed"
     assert "settings.json" in manager._read_manifest(profile / SHARE_MANIFEST)
+
+
+@pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+@pytest.mark.parametrize("shared", [False, True])
+def test_gateway_session_scrubs_settings_auth_overrides(manager, temp_home, auth, shared):
+    from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", auth=auth, slot=7)
+    profile, _, _ = manager.setup_session("7", share=False)
+    source = temp_home / ".claude" / "settings.json" if shared else profile / "settings.json"
+    contents = json.dumps({"theme": "kept", "env": {name: KEY for name in AUTH_OVERRIDE_ENV_VARS}})
+    source.write_text(contents)
+    manager.setup_session("7", share=shared)
+    settings = json.loads((profile / "settings.json").read_text())
+    assert settings["theme"] == "kept"
+    assert not any(name in settings.get("env", {}) for name in AUTH_OVERRIDE_ENV_VARS)
+    assert KEY not in (profile / "settings.json").read_text()
+    if shared:
+        assert source.read_text() == contents

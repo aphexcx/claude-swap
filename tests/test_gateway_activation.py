@@ -59,6 +59,20 @@ class TestGatewayActivation:
             s.switch_to("2", json_output=True)
         assert s._gateway_settings_path().read_text() == contents
 
+    @pytest.mark.parametrize("name", ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"])
+    def test_gateway_activation_refuses_settings_auth_overrides(self, gateway_switcher, name):
+        s = gateway_switcher
+        seed_oauth(s)
+        path = s._gateway_settings_path()
+        path.write_text(json.dumps({"env": {name: KEY}}))
+        settings = path.read_bytes()
+        sequence = s.sequence_file.read_bytes()
+        with pytest.raises(SwitchError, match=str(path)) as error:
+            s.switch_to("2", json_output=True)
+        assert KEY not in str(error.value)
+        assert path.read_bytes() == settings
+        assert s.sequence_file.read_bytes() == sequence
+
     @pytest.mark.parametrize("slot,email", [(2, None), (None, "gateway-2@token.local"), (4, "gateway-2@token.local"), (2, "other@example.com")])
     def test_active_gateway_add_token_overwrite_or_migration_refused(self, gateway_switcher, slot, email):
         s = gateway_switcher
