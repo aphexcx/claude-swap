@@ -467,3 +467,127 @@ def test_gateway_add_token_rechecks_identity_after_slot_swap(gateway_switcher, m
     assert (row["baseUrl"], key) == ("https://b.example", KEY + "-b")
     row, key = s.account_auth_snapshot("2", "a@example.com")
     assert (row["baseUrl"], key) == ("https://a.example", KEY)
+
+
+@pytest.mark.parametrize("operation", ["refresh", "slot", "import"])
+@pytest.mark.parametrize("failure", ["config", "cache", "sequence", "after-sequence"])
+def test_gateway_failed_replacement_refuses_credentials_until_retry(gateway_switcher, temp_home, monkeypatch, operation, failure):
+    from claude_swap.exceptions import ConfigError
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1, email="a@example.com")
+    s.add_account_from_token(KEY + "-control", base_url="https://control.example", slot=2)
+    path = temp_home / "replacement.json"
+    export_accounts(s, str(path), account="1")
+    envelope = json.loads(path.read_text())
+    envelope["accounts"][0].update(baseUrl="https://new.example", credentials=KEY + "-replacement")
+    path.write_text(json.dumps(envelope))
+    def replace():
+        if operation == "import":
+            import_accounts(s, str(path), force=True)
+        else:
+            s.add_account_from_token(KEY + "-replacement", base_url="https://new.example", email="a@example.com", slot=1 if operation == "slot" else None)
+    def fail(*args, **kwargs):
+        raise OSError(KEY)
+    with monkeypatch.context() as patch:
+        if failure == "config":
+            patch.setattr(s, "_write_account_config", fail)
+        elif failure == "cache":
+            patch.setattr(s._usage_store, "clear_dead_token", fail)
+        else:
+            write = s._write_json
+            def fail_commit(file, data):
+                if file == s.sequence_file and data.get("accounts", {}).get("1", {}).get("baseUrl") == "https://new.example":
+                    if failure == "after-sequence":
+                        write(file, data)
+                    fail()
+                return write(file, data)
+            patch.setattr(s, "_write_json", fail_commit)
+        with pytest.raises((OSError, ConfigError)):
+            replace()
+    fresh = ClaudeAccountSwitcher()
+    fresh.platform = Platform.LINUX
+    assert fresh._read_account_credentials("1", "a@example.com") == ""
+    assert fresh._read_account_credentials("2", fresh.account_email("2")) == KEY + "-control"
+    assert fresh.usage_entries_by_account()["1"].gateway["probeStatus"] == "transient"
+    with pytest.raises(ConfigError, match="incomplete.*retry"):
+        fresh.resolve_account("1")
+    replace()
+    row, key = fresh.account_auth_snapshot("1", "a@example.com")
+    assert (row["baseUrl"], key) == ("https://new.example", KEY + "-replacement")
+
+
+@pytest.mark.parametrize("failure", ["create", "clear", "read"])
+def test_gateway_replacement_marker_errors_fail_closed(gateway_switcher, monkeypatch, failure):
+    from pathlib import Path
+    from claude_swap.exceptions import ConfigError
+    from claude_swap import switcher as module
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    email = s.account_email("1")
+    marker = s._account_write_marker("1")
+    with monkeypatch.context() as patch:
+        if failure == "create":
+            write = module.atomic_write_text
+            def fail_write(path, text, *args, **kwargs):
+                if path == marker:
+                    raise OSError(KEY)
+                return write(path, text, *args, **kwargs)
+            patch.setattr(module, "atomic_write_text", fail_write)
+        elif failure == "clear":
+            unlink = Path.unlink
+            def fail_unlink(path, *args, **kwargs):
+                if path == marker:
+                    raise OSError(KEY)
+                return unlink(path, *args, **kwargs)
+            patch.setattr(Path, "unlink", fail_unlink)
+        else:
+            stat = Path.stat
+            def fail_stat(path, *args, **kwargs):
+                if path == marker:
+                    raise PermissionError(KEY)
+                return stat(path, *args, **kwargs)
+            patch.setattr(Path, "stat", fail_stat)
+            assert s._read_account_credentials("1", email) == ""
+            with pytest.raises(ConfigError, match="incomplete.*retry"):
+                s.resolve_account("1")
+            return
+        with pytest.raises(ConfigError, match="incomplete.*retry") as error:
+            s.add_account_from_token(KEY + "-new", base_url="https://new.example", slot=1)
+        assert KEY not in str(error.value)
+    assert s._read_account_credentials("1", email) == (KEY if failure == "create" else "")
+    s.add_account_from_token(KEY + "-new", base_url="https://new.example", slot=1)
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("operation", ["swap", "move", "empty-move", "remove", "migration-retry"])
+def test_gateway_pending_replacement_relocation_and_recovery(gateway_switcher, monkeypatch, operation):
+    from claude_swap.exceptions import ConfigError
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1, email="a@example.com")
+    s.add_account_from_token(KEY + "-b", base_url="https://b.example", slot=2)
+    pending = "3" if operation == "empty-move" else "1"
+    if operation == "migration-retry":
+        with monkeypatch.context() as patch:
+            def fail(*args):
+                raise OSError(KEY)
+            patch.setattr(s, "_write_account_config", fail)
+            with pytest.raises(ConfigError):
+                s.add_account_from_token(KEY + "-new", base_url="https://new.example", email="a@example.com", slot=3)
+        assert s._account_write_pending("1") and s._account_write_pending("3")
+        s.add_account_from_token(KEY + "-new", base_url="https://new.example", email="a@example.com", slot=3)
+        assert not s._account_write_pending("1") and not s._account_write_pending("3")
+        return
+    s._account_write_marker(pending).write_text(json.dumps({"slots": [pending]}))
+    before = s.sequence_file.read_bytes()
+    if operation == "remove":
+        s.remove_account("1", assume_yes=True)
+        assert not s._account_write_pending("1")
+        s.add_account_from_token(KEY + "-new", base_url="https://new.example", slot=1)
+        assert s._read_account_credentials("1", s.account_email("1")) == KEY + "-new"
+    else:
+        with pytest.raises(ConfigError, match="incomplete.*retry"):
+            s.swap_accounts("2", pending) if operation == "swap" else s.move_account("2", pending)
+        assert s.sequence_file.read_bytes() == before
