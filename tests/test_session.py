@@ -3092,3 +3092,51 @@ def test_gateway_malformed_settings_report_file_without_traceback(
     assert str(path) in output.out + output.err
     assert "Traceback" not in output.out + output.err
     assert path.read_text() == "{broken"
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_gateway_isolation_preserves_user_proxy_across_launch_and_switch(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates, managed,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    source = temp_home / ".claude" / "settings.json"
+    private = '{"theme":"private","env":{"ANTHROPIC_BASE_URL":"https://proxy.example","CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY":"1"}}'
+    source.write_text(private if managed else '{}')
+    profile = session_dir_for(s.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL)
+    manager.setup_session("2", share=True)
+    if not managed:
+        (profile / "settings.json").unlink()
+        (profile / "settings.json").write_text(private)
+        manager._write_manifest(profile / SHARE_MANIFEST, [])
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager.setup_session("2", share=True)
+    expected = json.loads(private)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    s.switch_to("7", json_output=True)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    s.switch_to("2", json_output=True)
+    assert json.loads((profile / "settings.json").read_text()) == expected
+    if not managed:
+        manager.setup_session("2", share=True)
+        assert (profile / "settings.json").read_text() == private
+
+
+def test_gateway_isolation_removes_registered_gateway_url(share_setup):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"env": {
+        "ANTHROPIC_BASE_URL": "https://gateway.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes",
+    }}))
+    manager._isolate_auth_settings(profile)
+    assert json.loads(path.read_text())["env"] == {
+        "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL, "KEEP": "yes",
+    }

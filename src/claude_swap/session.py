@@ -1119,13 +1119,24 @@ class SessionManager:
             raise SessionError(
                 f"Cannot read Claude settings file {source}; repair it before retrying"
             ) from None
-        if gateway_session or gateway.owned_slot(settings.get("apiKeyHelper")) is not None:
+        owned_helper = gateway.owned_slot(settings.get("apiKeyHelper")) is not None
+        gateway_urls = {
+            record.get("baseUrl")
+            for record in (self.switcher._get_sequence_data() or {}).get("accounts", {}).values()
+            if record.get("kind") == "gateway" and record.get("baseUrl")
+        }
+        gateway_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL") in gateway_urls
+        managed = source != path or path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
+        if not gateway_session and not managed and not owned_helper and not gateway_url:
+            return  # A profile-local customization belongs to its user.
+        if gateway_session or owned_helper:
             settings.pop("apiKeyHelper", None)
         env = settings.setdefault("env", {})
-        env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
+        if gateway_session or owned_helper or gateway_url:
+            env.pop("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", None)
         if gateway_session:
             env.pop("ANTHROPIC_BASE_URL", None)
-        else:
+        elif gateway_url or (managed and "ANTHROPIC_BASE_URL" not in env):
             env["ANTHROPIC_BASE_URL"] = gateway.FIRST_PARTY_URL
         if not env:
             settings.pop("env", None)
