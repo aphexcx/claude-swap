@@ -23,6 +23,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     LockError,
     SessionError,
+    StaleSwitchError,
     SwitchError,
     ValidationError,
 )
@@ -6786,7 +6787,8 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self, identifier: str, json_output: bool = False, force: bool = False,
+        *, expected_source: str | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -6896,6 +6898,7 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            expected_source=expected_source,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -7569,12 +7572,20 @@ class ClaudeAccountSwitcher:
                 return None
             return self._read_account_credentials(slot, accounts[slot]["email"]) or None
 
+    @contextmanager
+    def _check_expected_switch_source(self, expected_source: str | None):
+        """Caller holds all switch locks; check before settings mutation."""
+        if expected_source is not None and self.current_account_number() != expected_source:
+            raise StaleSwitchError("Active account changed; automatic switch discarded")
+        yield
+
     def _perform_switch(
         self,
         target_account: str,
         emit_output: bool = True,
         force_activate: bool = False,
         provenance: dict | None = None,
+        expected_source: str | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7696,6 +7707,7 @@ class ClaudeAccountSwitcher:
             FileLock(self.lock_file),
             claude_credentials_lock(),
             claude_config_lock(),
+            self._check_expected_switch_source(expected_source),
             self._gateway_settings_transaction(
                 target_account, provenance=provenance,
                 emit_output=emit_output, warnings_out=warnings_out,
