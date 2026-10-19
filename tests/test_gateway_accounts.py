@@ -347,3 +347,101 @@ def test_last_gateway_remove_settings_failure_is_cli_error(gateway_switcher, mon
     assert s.sequence_file.read_bytes() == sequence
     assert path.read_bytes() == before
     assert s._read_account_credentials("1", email) == credentials
+
+
+@pytest.mark.parametrize("operation", ["alias", "unalias", "threshold", "clear-threshold", "disable", "enable"])
+@pytest.mark.parametrize("target", ["1", "2"])
+def test_gateway_metadata_write_serializes_with_replacement(gateway_switcher, monkeypatch, operation, target):
+    from claude_swap.locking import FileLock
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    s.add_account_from_token("sk-ant-oat01-dummy", slot=2)
+    data = s._get_sequence_data()
+    data["accounts"][target].update(alias="original", threshold=50, disabled=operation == "enable")
+    s._write_json(s.sequence_file, data)
+    write = s._write_json
+    attempted = []
+
+    def racing_write(path, value):
+        if path == s.sequence_file and not attempted:
+            lock = FileLock(s.lock_file)
+            acquired = lock.acquire(timeout=0)
+            attempted.append(acquired)
+            if acquired:
+                try:
+                    latest = s._get_sequence_data()
+                    latest["accounts"]["1"]["baseUrl"] = "https://new.example"
+                    write(path, latest)
+                    s._write_account_credentials("1", latest["accounts"]["1"]["email"], KEY + "-replacement")
+                finally:
+                    lock.release()
+        return write(path, value)
+
+    monkeypatch.setattr(s, "_write_json", racing_write)
+    if operation == "alias":
+        s.set_alias(target, "changed")
+    elif operation == "unalias":
+        s.unset_alias(target)
+    elif "threshold" in operation:
+        s.set_account_threshold(target, None if operation == "clear-threshold" else 60)
+    else:
+        s.set_account_disabled(target, operation == "disable")
+    row, key = s.account_auth_snapshot("1", s.account_email("1"))
+    assert attempted
+    assert (row["baseUrl"], key) in [("https://old.example", KEY), ("https://new.example", KEY + "-replacement")]
+
+
+def test_gateway_migration_holds_roster_lock(gateway_switcher, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://old.example", slot=1)
+    s.add_account_from_token("sk-ant-oat01-dummy", slot=2)
+    data = s._get_sequence_data()
+    del data["accounts"]["2"]["organizationUuid"]
+    s._write_json(s.sequence_file, data)
+    read = s._read_account_config
+    attempted = []
+    def racing_read(num, email):
+        lock = FileLock(s.lock_file)
+        acquired = lock.acquire(timeout=0)
+        attempted.append(acquired)
+        if acquired:
+            try:
+                latest = s._get_sequence_data()
+                latest["accounts"]["1"]["baseUrl"] = "https://new.example"
+                s._write_json(s.sequence_file, latest)
+                s._write_account_credentials("1", latest["accounts"]["1"]["email"], KEY + "-replacement")
+            finally:
+                lock.release()
+        return read(num, email)
+    monkeypatch.setattr(s, "_read_account_config", racing_read)
+    s._get_sequence_data_migrated()
+    row, key = s.account_auth_snapshot("1", s.account_email("1"))
+    assert attempted
+    assert (row["baseUrl"], key) in [("https://old.example", KEY), ("https://new.example", KEY + "-replacement")]
+
+
+def test_gateway_roster_initialization_holds_lock(gateway_switcher, monkeypatch):
+    from claude_swap.locking import FileLock
+
+    s = gateway_switcher
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=1)
+    populated = s._get_sequence_data()
+    s.sequence_file.unlink()
+    write = s._write_json
+    attempted = []
+    def racing_write(path, data):
+        lock = FileLock(s.lock_file)
+        acquired = lock.acquire(timeout=0)
+        attempted.append(acquired)
+        if acquired:
+            try:
+                write(path, populated)
+            finally:
+                lock.release()
+        return write(path, data)
+    monkeypatch.setattr(s, "_write_json", racing_write)
+    s._init_sequence_file()
+    assert attempted == [False] or "1" in s._get_sequence_data()["accounts"]
