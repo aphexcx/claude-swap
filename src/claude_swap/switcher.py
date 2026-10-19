@@ -4353,11 +4353,17 @@ class ClaudeAccountSwitcher:
                 # The delete chokepoint rechecks live sessions; a session
                 # may have started since the pre-prompt check. Refuse before
                 # changing even the leftover first-party settings value.
+                def remove_gateway_settings():
+                    try:
+                        gateway.write_settings(path, None, remove_last=True)
+                    except (ValueError, OSError):
+                        raise ConfigError(
+                            f"Cannot update Claude settings file {path}; repair it before retrying removal"
+                        ) from None
+
                 self._delete_account_files(
                     account_num, email,
-                    before_delete=(
-                        lambda: gateway.write_settings(path, None, remove_last=True)
-                    ) if not remaining else None,
+                    before_delete=remove_gateway_settings if not remaining else None,
                 )
             else:
                 self._delete_account_files(account_num, email)
