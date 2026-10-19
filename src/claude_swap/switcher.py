@@ -10,6 +10,7 @@ import shutil
 import threading
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -849,7 +850,7 @@ class ClaudeAccountSwitcher:
         slots = sorted({str(num) for num in slots if num is not None})
         accounts = (self._get_sequence_data() or {}).get("accounts", {})
         gateway_active = gateway.active_slot(self._gateway_settings_path(), accounts) is not None
-        guarded = gateway_requested or (gateway_active and explicit_replacement) or any(
+        guarded = gateway_requested or explicit_replacement or any(
             accounts.get(num, {}).get("kind") == "gateway" or self._account_write_pending(num)
             for num in slots
         )
@@ -874,6 +875,10 @@ class ClaudeAccountSwitcher:
             yield
             data = self._get_sequence_data() or {}
             accounts = data.get("accounts", {})
+            if explicit_replacement:
+                for num in slots:
+                    if num in accounts:
+                        accounts[num]["authGeneration"] = uuid.uuid4().hex
             if gateway_active and explicit_replacement:
                 # The live OAuth store is retained on gateway. An explicit
                 # import/replacement supersedes those bytes even when its
@@ -893,6 +898,7 @@ class ClaudeAccountSwitcher:
                             accounts[num].pop("gatewayExplicitReplacement", None)
                         else:
                             accounts[num]["gatewayExplicitReplacement"] = True
+            if explicit_replacement:
                 self._write_json(self.sequence_file, data)
             for num in cleanup_slots:
                 # A retry can finish a migration after its source row was
@@ -4562,6 +4568,26 @@ class ClaudeAccountSwitcher:
             key = self._read_account_credentials(number, email) if record.get("kind") == "gateway" else ""
             return dict(record), key or ""
 
+    def _switch_target_snapshot(self, data: dict, number: str) -> dict | None:
+        record = data.get("accounts", {}).get(number)
+        if record is None or self._account_write_pending(number):
+            return None
+        result = {key: record.get(key) for key in (
+            "email", "organizationUuid", "authGeneration", "disabled", *gateway.RECORD_FIELDS,
+        )}
+        result["kind"] = record.get("kind", "oauth")
+        if result["kind"] == "gateway":
+            result["keyFingerprint"] = oauth.credential_fingerprint(
+                self._read_account_credentials(number, record["email"])
+            )
+        return result
+
+    def switch_target_snapshots(self) -> dict[str, dict | None]:
+        """Pin explicit replacements independently of automatic OAuth refresh."""
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            return {num: self._switch_target_snapshot(data, num) for num in data.get("accounts", {})}
+
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
@@ -6816,7 +6842,7 @@ class ClaudeAccountSwitcher:
 
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False,
-        *, expected_source: str | None = None,
+        *, expected_source: str | None = None, expected_target: dict | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -6927,6 +6953,7 @@ class ClaudeAccountSwitcher:
             force_activate=force,
             provenance=provenance,
             expected_source=expected_source,
+            expected_target=expected_target,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -7609,10 +7636,12 @@ class ClaudeAccountSwitcher:
             return self._read_account_credentials(slot, accounts[slot]["email"]) or None
 
     @contextmanager
-    def _check_expected_switch_source(self, expected_source: str | None):
+    def _check_expected_switch_source(self, expected_source: str | None, target: str, expected_target: dict | None):
         """Caller holds all switch locks; check before settings mutation."""
         if expected_source is not None and self.current_account_number() != expected_source:
             raise StaleSwitchError("Active account changed; automatic switch discarded")
+        if expected_target is not None and self._switch_target_snapshot(self._get_sequence_data() or {}, target) != expected_target:
+            raise StaleSwitchError("Target account changed; automatic switch discarded")
         yield
 
     def _perform_switch(
@@ -7622,6 +7651,7 @@ class ClaudeAccountSwitcher:
         force_activate: bool = False,
         provenance: dict | None = None,
         expected_source: str | None = None,
+        expected_target: dict | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7743,7 +7773,7 @@ class ClaudeAccountSwitcher:
             FileLock(self.lock_file),
             claude_credentials_lock(),
             claude_config_lock(),
-            self._check_expected_switch_source(expected_source),
+            self._check_expected_switch_source(expected_source, target_account, expected_target),
             self._gateway_settings_transaction(
                 target_account, provenance=provenance,
                 emit_output=emit_output, warnings_out=warnings_out,
