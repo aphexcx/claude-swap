@@ -3205,3 +3205,27 @@ def test_gateway_launch_snapshots_endpoint_and_key_together(manager, capture_exe
     assert attempted
     pair = (exc.value.env["ANTHROPIC_BASE_URL"], exc.value.env["ANTHROPIC_AUTH_TOKEN"])
     assert pair in [("https://old.example", KEY), ("https://new.example", KEY + "-replacement")]
+
+
+@pytest.mark.parametrize("url", ["https://gateway.example", "https://proxy.example"])
+@pytest.mark.parametrize("same_account", [False, True])
+def test_oauth_launch_scrubs_registered_gateway_environment(
+    manager, capture_exec, auth_status_tracks_seed, refresh_rotates, monkeypatch, url, same_account,
+):
+    from tests.test_gateway_accounts import KEY
+    s = manager.switcher
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    if same_account:
+        monkeypatch.setattr(s, "_get_current_account", lambda: (ACCOUNT_EMAIL, ORG_UUID))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", url)
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1")
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("2", [], share=False)
+    envs = [exc.value.env, *auth_status_tracks_seed]
+    for env in envs:
+        if url == "https://gateway.example":
+            assert "ANTHROPIC_BASE_URL" not in env
+            assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in env
+        else:
+            assert env["ANTHROPIC_BASE_URL"] == url
+            assert env["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"] == "1"
