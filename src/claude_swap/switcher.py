@@ -7037,6 +7037,14 @@ class ClaudeAccountSwitcher:
             # those generations: never copy the older live token back.
             stored = oauth.extract_oauth_data(backup) or {}
             live = oauth.extract_oauth_data(original_creds) or {}
+            nonrefreshable = (
+                data.get("accounts", {}).get(current_account, {}).get("kind") == "api_key"
+                or bool(stored.get("accessToken") and not stored.get("refreshToken"))
+            )
+            if nonrefreshable and backup != original_creds:
+                # API keys/setup tokens do not rotate. A changed backup is an
+                # explicit replacement; the live store was idle on gateway.
+                return ("stored-replacement", None)
             try:
                 stored_newer = float(stored.get("expiresAt") or 0) > float(
                     live.get("expiresAt") or 0
@@ -7300,7 +7308,12 @@ class ClaudeAccountSwitcher:
                 "differs from the stored backup and ownership could "
                 "not be verified — pre-fix backup)"
             )
-        elif kind in ("own-bytes", "stored-newer"):
+        elif kind in ("own-bytes", "stored-newer", "stored-replacement"):
+            if kind == "stored-replacement":
+                self._stash_live_credential(
+                    original_creds, "gateway-retained-live", current_account,
+                    provenance.get("resolved"),
+                )
             # Untouched since cswap wrote it — the slot already holds
             # these bytes. Refresh only the config backup. (Rare since
             # #145: activation composes live shared MCP state into the
