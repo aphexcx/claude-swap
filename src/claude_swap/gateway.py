@@ -315,8 +315,16 @@ def probe(
     except Exception:
         # Never return repr/str of an exception containing a Request or header.
         result.update(errorType="request_error", message="Gateway probe failed")
-    if result["probeStatus"] == "transient":
-        result["transientSince"] = previous.get("transientSince", now)
+    if result["probeStatus"] in ("cooling", "transient"):
+        # A continuously failing host can alternate 500/network and 503/529.
+        # Changing error class must not restart its departure grace period.
+        since = now
+        if previous.get("probeStatus") in ("cooling", "transient"):
+            since = previous.get("failureSince", previous.get(
+                "coolingSince", previous.get("transientSince", now)
+            ))
+        result["failureSince"] = since
+        result[result["probeStatus"] + "Since"] = since
     return result
 
 

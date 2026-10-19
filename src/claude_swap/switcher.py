@@ -3800,18 +3800,21 @@ class ClaudeAccountSwitcher:
             # on a race.
             self._reject_identity_drift_since_verify(identity)
 
-            self._write_account_credentials(account_num, current_email, current_creds)
-            self._write_account_config(account_num, current_email, current_config)
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (current_email, current_org_uuid)}
-            )
+            with FileLock(self.lock_file):
+                seq = self._get_sequence_data()
+                self._refuse_active_gateway_replacement(seq, account_num)
+                self._write_account_credentials(account_num, current_email, current_creds)
+                self._write_account_config(account_num, current_email, current_config)
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (current_email, current_org_uuid)}
+                )
 
-            if alias is not None:
-                seq["accounts"][account_num]["alias"] = alias
+                if alias is not None:
+                    seq["accounts"][account_num]["alias"] = alias
 
-            seq["activeAccountNumber"] = int(account_num)
-            seq["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, seq)
+                seq["activeAccountNumber"] = int(account_num)
+                seq["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
             self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
@@ -3922,52 +3925,56 @@ class ClaudeAccountSwitcher:
 
         self._reject_identity_drift_since_verify(identity)
 
-        # Now safe to perform destructive cleanup (new account data is in memory)
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        with FileLock(self.lock_file):
+            self._refuse_active_gateway_replacement(
+                self._get_sequence_data() or {}, account_num, migrate_from
+            )
+            # Now safe to perform destructive cleanup (new account data is in memory)
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            # Store backups
+            self._write_account_credentials(account_num, current_email, current_creds)
+            self._write_account_config(account_num, current_email, current_config)
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (current_email, organization_uuid)}
+            )
+
+            # Update sequence.json
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            data["accounts"][account_num] = {
+                "email": current_email,
+                "uuid": account_uuid,
+                "organizationUuid": organization_uuid,
+                "organizationName": organization_name,
+                "added": get_timestamp(),
+            }
+            carried_alias = alias if alias is not None else existing_alias
+            if carried_alias:
+                data["accounts"][account_num]["alias"] = carried_alias
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["activeAccountNumber"] = int(account_num)
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        # Store backups
-        self._write_account_credentials(account_num, current_email, current_creds)
-        self._write_account_config(account_num, current_email, current_config)
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (current_email, organization_uuid)}
-        )
-
-        # Update sequence.json
-        data = self._get_sequence_data()
-        data["accounts"][account_num] = {
-            "email": current_email,
-            "uuid": account_uuid,
-            "organizationUuid": organization_uuid,
-            "organizationName": organization_name,
-            "added": get_timestamp(),
-        }
-        carried_alias = alias if alias is not None else existing_alias
-        if carried_alias:
-            data["accounts"][account_num]["alias"] = carried_alias
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["activeAccountNumber"] = int(account_num)
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         if migrate_from:
@@ -4103,20 +4110,23 @@ class ClaudeAccountSwitcher:
                     f"Existing account metadata for {email} is inconsistent"
                 )
             self._refuse_active_gateway_replacement(seq, account_num)
-            self._write_account_credentials(account_num, email, credentials)
-            self._write_account_config(account_num, email, config)
-            # A refreshed credential invalidates any dead-token quarantine on this
-            # slot (mirrors ``add_account``); otherwise the stale strike row keeps
-            # the account stuck at "re-login needed" and it never fetches the new
-            # token. Token accounts are always personal, so org is "".
-            self._usage_store.clear_dead_token(
-                [account_num], {account_num: (email, "")}
-            )
-            seq["lastUpdated"] = get_timestamp()
-            seq["accounts"][account_num].update(gateway_fields)
-            if alias:
-                seq["accounts"][account_num]["alias"] = alias
-            self._write_json(self.sequence_file, seq)
+            with FileLock(self.lock_file):
+                seq = self._get_sequence_data()
+                self._refuse_active_gateway_replacement(seq, account_num)
+                self._write_account_credentials(account_num, email, credentials)
+                self._write_account_config(account_num, email, config)
+                # A refreshed credential invalidates any dead-token quarantine on this
+                # slot (mirrors ``add_account``); otherwise the stale strike row keeps
+                # the account stuck at "re-login needed" and it never fetches the new
+                # token. Token accounts are always personal, so org is "".
+                self._usage_store.clear_dead_token(
+                    [account_num], {account_num: (email, "")}
+                )
+                seq["lastUpdated"] = get_timestamp()
+                seq["accounts"][account_num].update(gateway_fields)
+                if alias:
+                    seq["accounts"][account_num]["alias"] = alias
+                self._write_json(self.sequence_file, seq)
             kind_label = (
                 "gateway" if gateway_fields else "API key" if is_api_key else "token"
             )
@@ -4174,53 +4184,57 @@ class ClaudeAccountSwitcher:
         else:
             account_num = str(self._get_next_account_number())
 
-        if displace_slot:
-            d_num, d_email, d_org = displace_slot
-            self._delete_account_files(d_num, d_email)
+        with FileLock(self.lock_file):
+            self._refuse_active_gateway_replacement(
+                self._get_sequence_data() or {}, account_num, migrate_from
+            )
+            if displace_slot:
+                d_num, d_email, d_org = displace_slot
+                self._delete_account_files(d_num, d_email)
+                data = self._get_sequence_data()
+                if int(d_num) in data["sequence"]:
+                    data["sequence"].remove(int(d_num))
+                del data["accounts"][d_num]
+                self._write_json(self.sequence_file, data)
+                self._prune_mappings(d_email, d_org)
+
+            if migrate_from:
+                data = self._get_sequence_data()
+                old_email = data["accounts"][migrate_from].get("email", "")
+                self._delete_account_files(migrate_from, old_email)
+                if int(migrate_from) in data["sequence"]:
+                    data["sequence"].remove(int(migrate_from))
+                del data["accounts"][migrate_from]
+                self._write_json(self.sequence_file, data)
+
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config)
+            # Reusing/overwriting a slot with a fresh credential lifts any dead-token
+            # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
+            self._usage_store.clear_dead_token(
+                [account_num], {account_num: (email, "")}
+            )
+
             data = self._get_sequence_data()
-            if int(d_num) in data["sequence"]:
-                data["sequence"].remove(int(d_num))
-            del data["accounts"][d_num]
+            record = {
+                "email": email,
+                "uuid": "",
+                "organizationUuid": "",
+                "organizationName": "",
+                "added": get_timestamp(),
+            }
+            if is_api_key:
+                record["kind"] = "api_key"
+            record.update(gateway_fields)
+            if alias:
+                record["alias"] = alias
+            data["accounts"][account_num] = record
+            if int(account_num) not in data["sequence"]:
+                data["sequence"].append(int(account_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+
             self._write_json(self.sequence_file, data)
-            self._prune_mappings(d_email, d_org)
-
-        if migrate_from:
-            data = self._get_sequence_data()
-            old_email = data["accounts"][migrate_from].get("email", "")
-            self._delete_account_files(migrate_from, old_email)
-            if int(migrate_from) in data["sequence"]:
-                data["sequence"].remove(int(migrate_from))
-            del data["accounts"][migrate_from]
-            self._write_json(self.sequence_file, data)
-
-        self._write_account_credentials(account_num, email, credentials)
-        self._write_account_config(account_num, email, config)
-        # Reusing/overwriting a slot with a fresh credential lifts any dead-token
-        # quarantine carried by that slot's prior lineage (mirrors ``add_account``).
-        self._usage_store.clear_dead_token(
-            [account_num], {account_num: (email, "")}
-        )
-
-        data = self._get_sequence_data()
-        record = {
-            "email": email,
-            "uuid": "",
-            "organizationUuid": "",
-            "organizationName": "",
-            "added": get_timestamp(),
-        }
-        if is_api_key:
-            record["kind"] = "api_key"
-        record.update(gateway_fields)
-        if alias:
-            record["alias"] = alias
-        data["accounts"][account_num] = record
-        if int(account_num) not in data["sequence"]:
-            data["sequence"].append(int(account_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
         source_label = (
             "gateway" if gateway_fields else "API key" if is_api_key else "token"
         )
@@ -7927,54 +7941,62 @@ class ClaudeAccountSwitcher:
 
         removed_items = []
 
-        # Remove credentials. On macOS backups may be in the Keychain and/or .enc
-        # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
-        data = self._get_sequence_data()
-        if data:
-            for account_num, account_info in data.get("accounts", {}).items():
-                email = account_info.get("email", "")
-                nums = [account_num]
-                if str(account_num) != "None":
-                    nums.append("None")
-                usernames = [f"account-{num}-{email}" for num in nums]
+        with FileLock(self.lock_file):
+            accounts = (self._get_sequence_data() or {}).get("accounts", {})
+            if gateway.active_slot(self._gateway_settings_path(), accounts) is not None:
+                raise ConfigError("Switch away from the active gateway before purging")
+            # Remove credentials. On macOS backups may be in the Keychain and/or .enc
+            # files (auto-fallback), so clean both; Linux/WSL/Windows are file-only.
+            data = self._get_sequence_data()
+            if data:
+                for account_num, account_info in data.get("accounts", {}).items():
+                    email = account_info.get("email", "")
+                    nums = [account_num]
+                    if str(account_num) != "None":
+                        nums.append("None")
+                    usernames = [f"account-{num}-{email}" for num in nums]
 
-                # .enc files (Linux/WSL/Windows always; macOS fallback copies).
-                for num in nums:
-                    cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
-                    try:
-                        if cred_file.exists():
-                            cred_file.unlink()
-                            removed_items.append(f"Credential file: {cred_file.name}")
-                    except Exception:
-                        pass  # Ignore errors during purge
-
-                # macOS Keychain items via `security` (current macOS backend).
-                if self.platform == Platform.MACOS:
-                    for username in usernames:
+                    # .enc files (Linux/WSL/Windows always; macOS fallback copies).
+                    for num in nums:
+                        cred_file = self.credentials_dir / f".creds-{num}-{email}.enc"
                         try:
-                            macos_keychain.delete_password(SECURITY_SERVICE, username)
-                            removed_items.append(f"Credential: {username}")
+                            if cred_file.exists():
+                                cred_file.unlink()
+                                removed_items.append(f"Credential file: {cred_file.name}")
                         except Exception:
                             pass  # Ignore errors during purge
 
-                # Best-effort sweep of any pre-migration keyring / Credential
-                # Manager entries left behind by an incomplete keyring → files
-                # (Windows) or keyring → security (macOS) migration. Linux/WSL
-                # never used a keyring backend.
-                if self.platform in (Platform.MACOS, Platform.WINDOWS):
-                    _sweep_legacy_keyring(usernames, removed_items)
+                    # macOS Keychain items via `security` (current macOS backend).
+                    if self.platform == Platform.MACOS:
+                        for username in usernames:
+                            try:
+                                macos_keychain.delete_password(SECURITY_SERVICE, username)
+                                removed_items.append(f"Credential: {username}")
+                            except Exception:
+                                pass  # Ignore errors during purge
 
-        # Session-profile keychain entries must go BEFORE the backup dir:
-        # the hashed service names are derived from the dir paths and can't
-        # be recomputed once the directories are deleted.
-        if session_dirs:
-            from claude_swap.session import delete_macos_keychain_entry
+                    # Best-effort sweep of any pre-migration keyring / Credential
+                    # Manager entries left behind by an incomplete keyring → files
+                    # (Windows) or keyring → security (macOS) migration. Linux/WSL
+                    # never used a keyring backend.
+                    if self.platform in (Platform.MACOS, Platform.WINDOWS):
+                        _sweep_legacy_keyring(usernames, removed_items)
 
-            for d in session_dirs:
-                delete_macos_keychain_entry(d)
-            removed_items.append(
-                f"Session profiles: {', '.join(d.name for d in session_dirs)}"
-            )
+            # Session-profile keychain entries must go BEFORE the backup dir:
+            # the hashed service names are derived from the dir paths and can't
+            # be recomputed once the directories are deleted.
+            if session_dirs:
+                from claude_swap.session import delete_macos_keychain_entry
+
+                for d in session_dirs:
+                    delete_macos_keychain_entry(d)
+                removed_items.append(
+                    f"Session profiles: {', '.join(d.name for d in session_dirs)}"
+                )
+
+            # Retire the roster before releasing the lock, so a waiting
+            # switch cannot activate credentials that purge just deleted.
+            self.sequence_file.unlink(missing_ok=True)
 
         # Remove backup directory
         if self.backup_dir.exists():

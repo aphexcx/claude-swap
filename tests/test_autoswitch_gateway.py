@@ -35,6 +35,25 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_mixed_gateway_failures_share_departure_grace(self, temp_home, monkeypatch):
+        from tests.test_gateway_probe import respond
+
+        h = fleet(temp_home, monkeypatch)
+        h.switcher.switch_to("3", json_output=True)
+        record = gateway.account_fields("https://gateway.example")
+        verdict = None
+        for index in range(12):
+            respond(monkeypatch, 500 if index % 2 == 0 else 503)
+            verdict = gateway.probe(record, KEY, now=h.clock(), previous=verdict)
+            entries = readings(h, second=85)
+            entries["3"] = UsageEntry(sentinel="gateway", gateway=verdict)
+            outcome = h.tick_with_entries(entries)
+            if outcome == TickOutcome.SWITCHED:
+                break
+            h.clock.advance(120)
+        assert outcome == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     def test_gateway_hold_inside_hysteresis_is_not_all_exhausted(self, temp_home, monkeypatch):
         h = fleet(temp_home, monkeypatch)
         h.switcher.switch_to("3", json_output=True)
