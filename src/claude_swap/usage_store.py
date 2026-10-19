@@ -1012,8 +1012,12 @@ class UsageStore:
         from claude_swap import gateway
 
         now = self.clock()
+        probe_config = {
+            name: record.get(name)
+            for name in ("baseUrl", "auth", "probeModel", "usageUrl")
+        }
         fingerprint = hashlib.sha256(
-            (key + json.dumps(record, sort_keys=True)).encode()
+            (key + json.dumps(probe_config, sort_keys=True)).encode()
         ).hexdigest()
         claim = None
         with self._lock():

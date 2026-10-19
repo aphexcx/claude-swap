@@ -257,3 +257,23 @@ class TestGatewayProbe:
         rows = store._read_rows()
         assert rows["1"]["sentinel"] == "gateway"
         assert KEY not in json.dumps(rows)
+
+
+@pytest.mark.parametrize("status", ["unauthorized", "transient"])
+@pytest.mark.parametrize("field,value", [("alias", "renamed"), ("threshold", 60), ("disabled", True)])
+def test_gateway_metadata_changes_preserve_failure_history(temp_home, monkeypatch, status, field, value):
+    now = [1000.0]
+    store = UsageStore(temp_home / "cache", clock=lambda: now[0])
+    record = gateway.account_fields("https://gateway.example")
+    def verdict(*args, **kw):
+        since = (kw.get("previous") or {}).get("failureSince", kw["now"])
+        return dict(probeStatus=status, probedAt=kw["now"], budget=None, failureSince=since, transientSince=since)
+    probe = Mock(side_effect=verdict)
+    monkeypatch.setattr(gateway, "probe", probe)
+    store.collect_gateway("1", ("gw@example.com", ""), record, KEY, active=True, fetch=True)
+    now[0] += 601
+    record[field] = value
+    entry = store.collect_gateway("1", ("gw@example.com", ""), record, KEY, active=True, fetch=True)
+    assert entry.gateway["failureSince"] == 1000
+    if status == "unauthorized":
+        assert probe.call_count == 1
