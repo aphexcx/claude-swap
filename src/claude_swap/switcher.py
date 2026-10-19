@@ -4328,12 +4328,17 @@ class ClaudeAccountSwitcher:
                 print(dimmed("Cancelled"))
                 return
 
-        if account_info.get("kind") == "gateway":
-            with (
-                FileLock(self.lock_file),
-                claude_credentials_lock(),
-                claude_config_lock(),
-            ):
+        with (
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
+            data = self._get_sequence_data() or {}
+            latest = data.get("accounts", {}).get(account_num)
+            if latest is None or any(latest.get(k) != account_info.get(k) for k in ("email", "organizationUuid", "uuid")):
+                raise ConfigError("Account changed during confirmation; retry removal")
+            account_info = latest
+            if account_info.get("kind") == "gateway":
                 remaining = [
                     n
                     for n, r in data["accounts"].items()
@@ -4354,19 +4359,17 @@ class ClaudeAccountSwitcher:
                         lambda: gateway.write_settings(path, None, remove_last=True)
                     ) if not remaining else None,
                 )
-        else:
-            self._delete_account_files(account_num, email)
+            else:
+                self._delete_account_files(account_num, email)
 
-        # Update sequence.json
-        del data["accounts"][account_num]
-        data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
-        data["lastUpdated"] = get_timestamp()
-
-        self._write_json(self.sequence_file, data)
-        if account_info.get("kind") == "gateway":
-            self._usage_store.forget(
-                account_num, (email, account_info.get("organizationUuid", "") or "")
-            )
+            del data["accounts"][account_num]
+            data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+            data["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, data)
+            if account_info.get("kind") == "gateway":
+                self._usage_store.forget(
+                    account_num, (email, account_info.get("organizationUuid", "") or "")
+                )
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 

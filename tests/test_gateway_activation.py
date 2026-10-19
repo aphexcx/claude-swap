@@ -388,3 +388,36 @@ def test_gateway_return_restores_backup_after_live_login_missing(gateway_switche
     assert s.current_account_number() == "1"
     assert s.read_account_credentials("1", s.account_email("1")) == backup
     assert json.loads(get_credentials_path().read_text()) == json.loads(backup)
+
+
+def test_gateway_remove_rechecks_replacement_activated_during_confirmation(gateway_switcher, monkeypatch):
+    s = gateway_switcher
+    seed_oauth(s)
+    def confirm(*args):
+        s.add_account_from_token(KEY, base_url="https://replacement.example", slot=2, assume_yes=True)
+        s.switch_to("2", json_output=True)
+        return "y"
+    monkeypatch.setattr("builtins.input", confirm)
+    with pytest.raises(ConfigError, match="Switch away from the active gateway"):
+        s.remove_account("2")
+    assert s.current_account_number() == "2"
+    assert s.gateway_credential("2") == KEY
+
+
+def test_gateway_remove_holds_roster_lock_through_sequence_commit(gateway_switcher, monkeypatch):
+    from claude_swap.locking import FileLock
+    s = gateway_switcher
+    seed_oauth(s)
+    write = s._write_json
+    held = []
+    def checked_write(path, data):
+        if path == s.sequence_file and "2" not in data.get("accounts", {}):
+            lock = FileLock(s.lock_file)
+            acquired = lock.acquire(timeout=0)
+            held.append(not acquired)
+            if acquired:
+                lock.release()
+        return write(path, data)
+    monkeypatch.setattr(s, "_write_json", checked_write)
+    s.remove_account("2", assume_yes=True)
+    assert held == [True]
