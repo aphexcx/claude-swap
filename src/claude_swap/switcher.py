@@ -2216,7 +2216,7 @@ class ClaudeAccountSwitcher:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        return self._find_active_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -3400,6 +3400,17 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _find_active_account_slot(
+        self, data: dict, email: str, organization_uuid: str
+    ) -> str | None:
+        """A retained OAuth identity cannot establish gateway activation."""
+        slot = self._find_account_slot(data, email, organization_uuid)
+        accounts = data.get("accounts", {})
+        if slot is not None and accounts[slot].get("kind") == "gateway":
+            if gateway.active_slot(self._gateway_settings_path(), accounts) != slot:
+                return None
+        return slot
+
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
@@ -4533,7 +4544,7 @@ class ClaudeAccountSwitcher:
         active_num = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+            active_num = self._find_active_account_slot(data, current_email, current_org_uuid)
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
@@ -6203,7 +6214,7 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         if not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -6273,7 +6284,7 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         org_name = ""
         if account_num is not None:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
@@ -6486,7 +6497,9 @@ class ClaudeAccountSwitcher:
         current_email, current_org_uuid = identity
 
         # Check if current account is managed
-        if not self._account_exists(current_email, current_org_uuid):
+        if self._find_active_account_slot(
+            self._get_sequence_data() or {}, current_email, current_org_uuid
+        ) is None:
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
@@ -6511,7 +6524,7 @@ class ClaudeAccountSwitcher:
 
         if len(sequence) < 2:
             if json_output:
-                num = self._find_account_slot(data, current_email, current_org_uuid)
+                num = self._find_active_account_slot(data, current_email, current_org_uuid)
                 return self._switch_noop(
                     strategy=strategy_label,
                     reason="only-one-account",
@@ -6525,7 +6538,7 @@ class ClaudeAccountSwitcher:
         # Where the user actually is right now (live identity), falling back to
         # the recorded active slot. Used so usage-aware switching never moves
         # them onto an account worse than their current one.
-        current_num = self._find_account_slot(data, current_email, current_org_uuid)
+        current_num = self._find_active_account_slot(data, current_email, current_org_uuid)
         if current_num is None:
             current_num = str(active_account) if active_account is not None else None
 
@@ -6842,7 +6855,7 @@ class ClaudeAccountSwitcher:
         if not force and data:
             identity = self._get_current_account()
             if identity is not None:
-                cur_slot = self._find_account_slot(data, identity[0], identity[1])
+                cur_slot = self._find_active_account_slot(data, identity[0], identity[1])
                 if (
                     cur_slot == target_account
                     and self._account_kind(target_account) == "gateway"
@@ -7453,7 +7466,7 @@ class ClaudeAccountSwitcher:
             yield None
             return
         identity = self._get_current_account()
-        source_num = self._find_account_slot(data, *identity) if identity else None
+        source_num = self._find_active_account_slot(data, *identity) if identity else None
         from_ref = (
             account_ref(int(source_num) if source_num else None, identity[0])
             if identity
@@ -7695,7 +7708,7 @@ class ClaudeAccountSwitcher:
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                current_account = self._find_active_account_slot(
                     data, current_email, current_org_uuid
                 )
 
