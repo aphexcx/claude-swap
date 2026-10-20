@@ -2937,6 +2937,28 @@ class TestAConsumedGrantIsNotSpentOnAProfileThatWonBootstrap:
 
         assert not session_dir.exists()
 
+    def test_identity_conflict_never_bootstraps_or_reposts_on_retry(
+        self, manager, seeded_switcher, monkeypatch
+    ):
+        from unittest.mock import Mock
+
+        post = Mock(return_value=oauth.RefreshOutcome(
+            ROTATED_CREDS, None, {"uuid": "foreign-account", "organizationUuid": "foreign-org"}
+        ))
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        bootstrap = Mock(side_effect=AssertionError("must not bootstrap a conflicting identity"))
+        monkeypatch.setattr(manager, "_bootstrap", bootstrap)
+        for _ in range(2):
+            with pytest.raises(SessionError, match="belongs to another account"):
+                manager.setup_session(ACCOUNT_NUM, share=False)
+        assert post.call_count == 1
+        bootstrap.assert_not_called()
+        assert seeded_switcher.read_account_credentials(ACCOUNT_NUM, ACCOUNT_EMAIL) == CREDS
+        assert any(
+            seeded_switcher._store._read_unclaimed_credential(i) == (ROTATED_CREDS, False)
+            for i in seeded_switcher.list_unclaimed_credentials()
+        )
+
     def test_a_failed_persist_does_not_seed_the_profile_from_a_spent_grant(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch
     ):

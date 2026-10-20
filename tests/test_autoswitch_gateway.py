@@ -35,6 +35,116 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_gateway_return_waits_for_unreadable_healthy_stash_sibling(self, temp_home, monkeypatch):
+        import json
+        from claude_swap import oauth
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        s.switch_to("3", json_output=True)
+        h.seed(2, "two@example.com", expires_at=1000)
+        current = s._read_account_credentials("2", "two@example.com")
+        context = {"configSlot": "2", "consumedFp": oauth.credential_fingerprint(current)}
+        def creds(label):
+            return json.dumps({"claudeAiOauth": {"accessToken": label + "-access", "refreshToken": label + "-refresh", "expiresAt": 9999999999999}})
+        foreign = s._store._write_unclaimed_credential(creds("foreign"), dict(context, tokenAccount={"uuid": "foreign"}))
+        healthy = s._store._write_unclaimed_credential(creds("healthy"), dict(context, tokenAccount={"uuid": "uuid-2"}))
+        read = s._store._read_unclaimed_credential
+        locked = [True]
+        monkeypatch.setattr(s._store, "_read_unclaimed_credential", lambda i: ("", True) if i == healthy and locked[0] else read(i))
+        post = Mock(side_effect=AssertionError("must not POST a spent predecessor"))
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        entries = readings(h, second=10, status="exhausted")
+        assert h.tick_with_entries(entries) != TickOutcome.SWITCHED
+        assert "2" not in h.state().get("quarantine", {})
+        locked[0] = False
+        assert h.tick_with_entries(entries) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert s._read_account_credentials("2", "two@example.com") == creds("healthy")
+        assert read(foreign) == (creds("foreign"), False)
+        post.assert_not_called()
+
+    @pytest.mark.parametrize("uuid_before", ["", " uuid-2 "])
+    @pytest.mark.parametrize("unreadable", [False, True])
+    def test_gateway_refresh_rechecks_identity_backfill_and_normalizes_uuid(self, temp_home, monkeypatch, uuid_before, unreadable):
+        import json
+        from claude_swap import oauth
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        h.seed(2, "two@example.com", expires_at=1000)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["uuid"] = uuid_before
+        s._write_json(s.sequence_file, data)
+        current = s._read_account_credentials("2", "two@example.com")
+        successor = json.dumps({"claudeAiOauth": {"accessToken": "successor-access", "refreshToken": "successor-refresh", "expiresAt": 9999999999999}})
+        def refresh(*_):
+            if not uuid_before:
+                s.backfill_account_uuid("2", "uuid-2")
+            if unreadable:
+                monkeypatch.setattr(s, "_read_account_credentials_ex", lambda *_: ("", True))
+            return oauth.RefreshOutcome(successor, None, {"uuid": "foreign" if not uuid_before else "uuid-2"})
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        outcome = s.consume_backup_grant("2", "two@example.com", current)
+        if not uuid_before:
+            assert outcome.error == "identity-conflict"
+            assert outcome.credentials is None
+            assert outcome.stashed
+            assert s._read_account_credentials("2", "two@example.com") == current
+        else:
+            assert outcome.error == ("transient" if unreadable else None)
+            assert outcome.credentials == successor
+
+    @pytest.mark.parametrize("identity", ["uuid-conflict", "org-conflict", "match", "missing"])
+    def test_gateway_return_preserves_stashed_successor_identity(self, temp_home, monkeypatch, identity):
+        import json
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        s.switch_to("3", json_output=True)
+        h.seed(2, "two@example.com", expires_at=1000)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["organizationUuid"] = "slot-org"
+        s._write_json(s.sequence_file, data)
+        s._write_account_config("2", "two@example.com", json.dumps({"oauthAccount": {"emailAddress": "two@example.com", "accountUuid": "uuid-2", "organizationUuid": "slot-org"}}))
+        path = temp_home / "identical-refresh-import.json"
+        export_accounts(s, str(path), account="2")
+        predecessor = s._read_account_credentials("2", "two@example.com")
+        successor = json.dumps({"claudeAiOauth": {"accessToken": "successor-access", "refreshToken": "successor-refresh", "expiresAt": 9999999999999}})
+        token_account = None if identity == "missing" else {
+            "uuid": "foreign-uuid" if identity == "uuid-conflict" else "uuid-2",
+            "organizationUuid": "foreign-org" if identity == "org-conflict" else "slot-org",
+            "email": "two@example.com",
+        }
+        def refresh(*args, **kwargs):
+            import_accounts(s, str(path), force=True)
+            return oauth.RefreshOutcome(successor, None, token_account)
+        post = Mock(side_effect=refresh)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", post)
+        monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        entries = readings(h, second=10, status="exhausted")
+        assert h.tick_with_entries(entries) != TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert any(s._store._read_unclaimed_credential(i) == (successor, False) for i in s.list_unclaimed_credentials())
+        outcome = h.tick_with_entries(entries)
+        if identity.endswith("conflict"):
+            assert outcome != TickOutcome.SWITCHED
+            assert h.active_number() == 3
+            assert h.state()["quarantine"]["2"]["reason"] == "identity-conflict"
+            assert h.tick_with_entries(entries) != TickOutcome.SWITCHED
+            assert h.active_number() == 3
+            assert s._read_account_credentials("2", "two@example.com") == predecessor
+            manifest = s.list_unclaimed_credentials()
+            assert any(row.get("tokenAccount") == token_account for row in manifest.values())
+            assert any(s._store._read_unclaimed_credential(i) == (successor, False) for i in manifest)
+        else:
+            assert outcome == TickOutcome.SWITCHED
+            assert h.active_number() == 2
+        assert post.call_count == 1
+
     def test_gateway_return_keeps_identity_paired_with_refresh_cas_winner(self, temp_home, monkeypatch):
         import json
         from claude_swap import oauth
@@ -89,14 +199,18 @@ class TestAutoswitchGateway:
                     replace_token()
                 return oauth.RefreshOutcome(None, "invalid_grant")
             return oauth.RefreshOutcome(foreign, None, {"uuid": "foreign"})
-        def note(*args):
-            armed.append(True)
-            if phase == "freshening":
-                replace_token()
-            return True
+        consume = s.consume_backup_grant
+        def consume_then_race(*args):
+            outcome = consume(*args)
+            if failure == "identity-conflict":
+                assert outcome.error == "identity-conflict"
+                armed.append(True)
+                if phase == "freshening":
+                    replace_token()
+            return outcome
+        monkeypatch.setattr(s, "consume_backup_grant", consume_then_race)
         monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
         monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
-        monkeypatch.setattr(h.engine, "_note_token_identity", note)
         state_lock = h.engine._state_lock
         def race():
             if phase == "state-lock" and armed:
