@@ -7320,10 +7320,15 @@ class ClaudeAccountSwitcher:
             except (TypeError, ValueError):
                 stored_newer = False
             if stored_newer and stored.get("accessToken"):
-                if kind == "unresolved":
+                retained = data.get("gatewayRetainedLiveFp")
+                if kind == "unresolved" and not (
+                    retained and retained == oauth.credential_fingerprint(original_creds)
+                ):
                     # Expiry orders generations, but cannot prove this live
-                    # login belongs to the slot. Preserve its only copy before
-                    # activating the newer backup, as for explicit replacement.
+                    # login belongs to the slot: it changed since the entry
+                    # backup reconciled it, or no backup ran. Preserve its
+                    # only copy before activating the newer backup, as for
+                    # explicit replacement.
                     return ("stored-replacement", None)
                 return ("stored-newer", None)
         return kind, foreign_slot
@@ -7616,6 +7621,7 @@ class ClaudeAccountSwitcher:
                 if not acct.get("uuid") and resolved.get("uuid"):
                     acct["uuid"] = resolved["uuid"]
             self._logger.info(f"Backed up account {current_account}")
+        return kind
 
 
     def _stash_live_credential(
@@ -7660,6 +7666,16 @@ class ClaudeAccountSwitcher:
                 "credentialsMtime": creds_mtime,
             },
         )
+        if reason == "gateway-retained-live":
+            self._logger.warning(
+                "Live login retained during the gateway episode was not written "
+                "into Account-%s, whose stored credential replaces it: stashed "
+                "as %s (credentials mtime %s).",
+                current_account,
+                entry_id,
+                creds_mtime or "unknown",
+            )
+            return entry_id
         self._logger.warning(
             "Live credential does not belong to Account-%s (%s): stashed as %s "
             "(credentials mtime %s). Something outside cswap rewrote the live "
@@ -7742,6 +7758,7 @@ class ClaudeAccountSwitcher:
     def _clear_gateway_replacement_flags(data: dict) -> None:
         for record in data.get("accounts", {}).values():
             record.pop("gatewayExplicitReplacement", None)
+        data.pop("gatewayRetainedLiveFp", None)
 
     @contextmanager
     def _gateway_settings_transaction(
@@ -7806,11 +7823,20 @@ class ClaudeAccountSwitcher:
                     # A missing OAuth login is itself a reason to recover
                     # onto the gateway; activation never replaces that store.
                     if live:
-                        self._backup_outgoing_credential(
+                        kind = self._backup_outgoing_credential(
                             source_num, identity[0], live,
                             self._get_claude_config_path().read_text(encoding="utf-8"),
                             provenance, data, emit_output, warnings_out,
                         )
+                        fingerprint = oauth.credential_fingerprint(live)
+                        if fingerprint and kind in (
+                            "own-bytes", "own-family", "own-rotated", "unresolved",
+                        ):
+                            # A managed slot now holds this retained login's
+                            # lineage. Remember it, outside the account rows,
+                            # so the return can tell that older login from
+                            # one written during the episode.
+                            data["gatewayRetainedLiveFp"] = fingerprint
                 # Existing OAuth sessions may still share settings via a
                 # symlink from before any gateway was added. Detach their
                 # auth settings before changing the default login, including
