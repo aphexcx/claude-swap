@@ -803,19 +803,26 @@ class AutoSwitchEngine:
 
     # -- quarantine -----------------------------------------------------------
 
-    def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
-        fingerprint = _refresh_fingerprint(creds) if creds else None
-
-        def add(state: dict) -> None:
+    def _quarantine(self, number: str, email: str, reason: str, *, expected_auth: dict | None = None) -> None:
+        # Match switch commit order: state, then roster. Publication and the
+        # credential fingerprint must refer to the generation that failed.
+        with self._state_lock(), FileLock(self.switcher.lock_file):
+            auth = self.switcher._switch_target_snapshot(self.switcher._get_sequence_data() or {}, number)
+            if expected_auth is not None and auth != expected_auth:
+                return
+            creds = self.switcher.read_account_credentials(number, email)
+            fingerprint = _refresh_fingerprint(creds) if creds else None
+            state = self._read_state()
+            state["schemaVersion"] = STATE_SCHEMA_VERSION
             state.setdefault("quarantine", {})[number] = {
                 "email": email,
                 "reason": reason,
                 "at": _now_iso(),
                 "refreshTokenFingerprint": fingerprint,
+                "authGeneration": (auth or {}).get("authGeneration"),
+                "kind": (auth or {}).get("kind"),
             }
-
-        self._mutate_state(add)
+            atomic_write_json(self.state_path, state)
         self._emit(QuarantineEvent(number=number, email=email, reason=reason))
 
     def _release_recovered_quarantines(self, state: dict) -> dict:
@@ -829,12 +836,19 @@ class AutoSwitchEngine:
         if not isinstance(quarantine, dict) or not quarantine:
             return state
         to_release: list[tuple[str, str, str]] = []
+        auth = self.switcher.switch_target_snapshots()
         for number, entry in quarantine.items():
             email_now = self.switcher.account_email(number)
             if not email_now or email_now != entry.get("email"):
                 to_release.append(
                     (number, entry.get("email", ""), "account-replaced")
                 )
+                continue
+            current_auth = auth.get(number) or {}
+            if "authGeneration" in entry and any(
+                current_auth.get(key) != entry.get(key) for key in ("authGeneration", "kind")
+            ):
+                to_release.append((number, email_now, "account-replaced"))
                 continue
             creds = self.switcher.read_account_credentials(number, email_now)
             fingerprint = _refresh_fingerprint(creds) if creds else None
@@ -847,7 +861,8 @@ class AutoSwitchEngine:
             q = s.get("quarantine")
             if isinstance(q, dict):
                 for number, _, _ in to_release:
-                    q.pop(number, None)
+                    if q.get(number) == quarantine.get(number):
+                        q.pop(number, None)
 
         state = self._mutate_state(drop)
         for number, email, reason in to_release:
@@ -1634,11 +1649,12 @@ class AutoSwitchEngine:
 
     def _prepare_target(self, number: str, email: str) -> str:
         """Persist quarantine for a failed freshen on every rotation path."""
+        expected_auth = self.switcher.switch_target_snapshots().get(number) or {}
         status = self._freshen_target(number, email)
         if status in ("identity-conflict", "invalid_grant"):
             # Freshening may already have persisted a foreign successor.
             # Fingerprint that generation so it stays excluded next tick.
-            self._quarantine(number, email, status)
+            self._quarantine(number, email, status, expected_auth=expected_auth)
         return status
 
     @staticmethod
