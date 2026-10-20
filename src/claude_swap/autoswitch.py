@@ -1662,7 +1662,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {})
+                return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant"):
                 continue
@@ -1685,7 +1685,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {})
+            return self._perform(num, email, trigger, left_snapshot, expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
 
         if systemic or transient_failure:
             self._emit(
@@ -1810,7 +1810,7 @@ class AutoSwitchEngine:
         for num in ordered:
             email = self.switcher.account_email(num)
             if self.dry_run:
-                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {})
+                return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
             status = self._prepare_target(num, email)
             if status in ("identity-conflict", "invalid_grant", "skip-live-session"):
                 continue
@@ -1821,7 +1821,7 @@ class AutoSwitchEngine:
                 if not systemic or _SYSTEMIC_STATUSES.index(status) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {})
+            return self._perform(num, email, trigger, (None, float("inf")), expected_source=current, expected_target=target_snapshots.get(num) or {}, expected_source_auth=target_snapshots.get(current) or {})
         if systemic or transient_failure:
             self._emit(ErrorEvent(
                 message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
@@ -2707,6 +2707,7 @@ class AutoSwitchEngine:
         left: tuple[float | None, float],
         *, expected_source: str | None = None,
         expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> TickOutcome:
         if self.dry_run:
             current = self.switcher.current_account_number()
@@ -2741,6 +2742,8 @@ class AutoSwitchEngine:
                 source_args = {"expected_source": expected_source} if expected_source is not None else {}
                 if expected_target is not None:
                     source_args["expected_target"] = expected_target
+                if expected_source_auth is not None:
+                    source_args["expected_source_auth"] = expected_source_auth
                 result = self.switcher.switch_to(number, json_output=True, **source_args)
             except StaleSwitchError:
                 self._emit(NoSwitchEvent(reason="active-account-changed"))

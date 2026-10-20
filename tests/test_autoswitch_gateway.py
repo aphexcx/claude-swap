@@ -78,18 +78,29 @@ class TestAutoswitchGateway:
         assert "lastSwitchAt" not in h.state()
 
     @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
-    @pytest.mark.parametrize("origin", ["gateway", "oauth"])
-    def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase, origin):
+    @pytest.mark.parametrize("origin,replacement", [("gateway", "other"), ("oauth", "other"), ("oauth", "same")])
+    def test_gateway_departure_discards_changed_active_source(self, temp_home, monkeypatch, phase, origin, replacement):
+        import json
+        from claude_swap.transfer import export_accounts, import_accounts
+
         h = fleet(temp_home, monkeypatch)
         s = h.switcher
         s.add_account_from_token(KEY + "-b", slot=4, base_url="https://b.example")
         if origin == "gateway":
             s.switch_to("3", json_output=True)
         activated = []
+        new_source = "1" if replacement == "same" else "4"
         def activate_other():
             if not activated:
                 activated.append(True)
-                s.switch_to("4", json_output=True)
+                if replacement == "same":
+                    path = temp_home / "source-replacement.json"
+                    export_accounts(s, str(path), account="1")
+                    envelope = json.loads(path.read_text())
+                    envelope["accounts"][0].update(kind="gateway", credentials=KEY + "-b", baseUrl="https://b.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+                    path.write_text(json.dumps(envelope))
+                    import_accounts(s, str(path), force=True)
+                s.switch_to(new_source, json_output=True)
                 activated.append((s._gateway_settings_path().read_bytes(), s._read_credentials()))
         if phase == "freshening":
             def prepare(*args):
@@ -105,8 +116,8 @@ class TestAutoswitchGateway:
         entries = readings(h, second=10, status="exhausted")
         entries["4"] = UsageEntry(sentinel="gateway", gateway=dict(probeStatus="ok", probedAt=h.clock(), budget=None))
         assert h.tick_with_entries(entries) == TickOutcome.NO_ACTION
-        assert h.active_number() == 4
-        assert s.gateway_credential("4") == KEY + "-b"
+        assert h.active_number() == int(new_source)
+        assert s.gateway_credential(new_source) == KEY + "-b"
         assert (s._gateway_settings_path().read_bytes(), s._read_credentials()) == activated[1]
         assert not any(isinstance(e, SwitchEvent) for e in h.events)
         assert "lastSwitchAt" not in h.state()
