@@ -3059,6 +3059,7 @@ def test_gateway_activation_cannot_relink_reused_oauth_session(
     source = temp_home / ".claude" / "settings.json"
     source.write_text('{"theme":"kept"}')
     profile, _, _ = manager.setup_session("2", share=True)
+    credential_before = oauth.credential_fingerprint(session_mod.read_session_credentials(profile))
     assert (profile / "settings.json").is_symlink()
     finished = threading.Event()
     errors, threads, calls = [], [], []
@@ -3084,7 +3085,7 @@ def test_gateway_activation_cannot_relink_reused_oauth_session(
         return result
     monkeypatch.setattr(manager, "_has_gateway_accounts", race)
     try:
-        with pytest.raises(_ExecCalled):
+        with pytest.raises(_ExecCalled) as launched:
             manager.run("2", [], share=True)
     finally:
         for worker in threads:
@@ -3092,6 +3093,9 @@ def test_gateway_activation_cannot_relink_reused_oauth_session(
     assert threads and finished.is_set()
     assert errors == []
     assert s.current_account_number() == "7"
+    assert gateway.owned_slot(json.loads(source.read_text()).get("apiKeyHelper")) == "7"
+    assert launched.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert oauth.credential_fingerprint(session_mod.read_session_credentials(profile)) == credential_before
     assert not (profile / "settings.json").is_symlink()
     settings = json.loads((profile / "settings.json").read_text())
     assert settings["theme"] == "kept"
