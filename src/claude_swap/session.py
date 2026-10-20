@@ -735,6 +735,7 @@ class SessionManager:
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
         if prepared_kind == "gateway":
             _mkdir_private(session_dir)
+            self._init_gateway_config(session_dir)
             self._sync_sharing(session_dir, share, share_history, gateway_session=True)
             self._isolate_auth_settings(session_dir, gateway_session=True)
             return session_dir, account_num, email
@@ -997,6 +998,36 @@ class SessionManager:
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
+
+    def _init_gateway_config(self, session_dir: Path) -> None:
+        """Seed a new gateway profile's .claude.json without any login.
+
+        The OAuth bootstrap writes this file with the account identity. A
+        gateway profile authenticates through the launch environment, so it
+        gets only the onboarding keys. Without the file, the MCP mirror has
+        nothing to splice into on the first launch. An existing file belongs
+        to the profile (or a claude running in it) and is left alone.
+        """
+        config_path = session_dir / ".claude.json"
+        if config_path.exists() or config_path.is_symlink():
+            return
+        default = self._load_json_object(get_default_global_config_path()) or {}
+        theme = default.get("theme")
+        lock_dir = config_path.parent / (config_path.name + ".lock")
+        try:
+            with proper_lockfile(lock_dir):
+                if config_path.exists() or config_path.is_symlink():
+                    return
+                atomic_write_text(config_path, json.dumps({
+                    "hasCompletedOnboarding": True,
+                    "theme": theme if isinstance(theme, str) and theme else "dark",
+                }, indent=2))
+        except (ClaudeCodeLockTimeout, OSError) as e:
+            # Claude creates its own config on first start; only the shared
+            # MCP servers wait for the next launch.
+            self._logger.warning(
+                f"Could not initialize {config_path} ({e}) — continuing."
+            )
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:
