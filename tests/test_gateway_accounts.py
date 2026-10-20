@@ -62,6 +62,43 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("view", ["json-list", "dashboard"])
+    def test_gateway_rendering_uses_one_metadata_snapshot(self, gateway_switcher, temp_home, monkeypatch, view):
+        from claude_swap import oauth
+
+        s = gateway_switcher
+        s.add_account_from_token("sk-ant-oat01-dummy", slot=1)
+        path = temp_home / "render-replacement.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="gateway", credentials=KEY, baseUrl="https://gateway.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", lambda *args, **kwargs: oauth.UsageOutcome({"five_hour": {"pct": 10}}))
+        armed, replaced = [False], []
+        collect, read = s._collect_usage_entries, s._get_sequence_data
+        def arm(*args, **kwargs):
+            result = collect(*args, **kwargs)
+            armed[0] = True
+            return result
+        def race():
+            data = read()
+            if armed[0]:
+                armed[0] = False
+                import_accounts(s, str(path), force=True)
+                replaced.append(True)
+            return data
+        monkeypatch.setattr(s, "_collect_usage_entries", arm)
+        monkeypatch.setattr(s, "_get_sequence_data", race)
+        if view == "json-list":
+            payload = s.list_accounts(json_output=True)
+            assert "gateway" not in payload["accounts"][0]
+        else:
+            snapshot = s.accounts_snapshot()
+            assert snapshot.accounts[0].kind == "oauth"
+            assert snapshot.accounts[0].gateway is None
+        assert replaced
+        assert s.account_kind_for("1") == "gateway"
+
     @pytest.mark.parametrize("active", [False, True])
     def test_gateway_import_discards_oauth_polling_deadline(self, gateway_switcher, temp_home, monkeypatch, active):
         from unittest.mock import Mock

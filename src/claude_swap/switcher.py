@@ -1921,6 +1921,8 @@ class ClaudeAccountSwitcher:
         accounts: list[AccountSnapshot] = []
         for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
             n = str(num)
+            record = seq_data.get("accounts", {}).get(n, {})
+            kind = record.get("kind", "oauth")
             if is_active:
                 active_number = n
             accounts.append(
@@ -1930,15 +1932,15 @@ class ClaudeAccountSwitcher:
                     org_name=org_name,
                     org_uuid=org_uuid,
                     is_active=is_active,
-                    kind=self._account_kind(n),
+                    kind=kind,
                     switchable=self._account_is_switchable(n),
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
                     policy=self._policy_from_data(seq_data, n),
                     gateway=(
-                        gateway.json_fields(seq_data["accounts"][n], entries[n].gateway)
-                        if self._account_kind(n) == "gateway"
+                        gateway.json_fields(record, entries[n].gateway)
+                        if kind == "gateway"
                         else None
                     ),
                 )
@@ -6178,6 +6180,7 @@ class ClaudeAccountSwitcher:
         now = self._usage_store.clock()
         for info in accounts_info:
             num, email, org_name, org_uuid, is_active, creds, alias = info
+            record = seq_data.get("accounts", {}).get(str(num), {})
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -6209,9 +6212,9 @@ class ClaudeAccountSwitcher:
                     ),
                     gateway_info=(
                         gateway.json_fields(
-                            seq_data["accounts"][str(num)], entry.gateway
+                            record, entry.gateway
                         )
-                        if self._account_kind(str(num)) == "gateway"
+                        if record.get("kind") == "gateway"
                         else None
                     ),
                 )
