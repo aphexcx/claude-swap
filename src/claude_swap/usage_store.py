@@ -1044,6 +1044,7 @@ class UsageStore:
                 row["gatewayFingerprint"] = None
             if (
                 not self._matches(row, identity)
+                or "gatewayFingerprint" not in row
                 or ("gatewayAuthGeneration" in row and row["gatewayAuthGeneration"] != record.get("authGeneration"))
                 or ("gatewayConfigFingerprint" in row and row["gatewayConfigFingerprint"] != config_fingerprint)
                 or (key and row.get("gatewayFingerprint") not in (None, fingerprint))
