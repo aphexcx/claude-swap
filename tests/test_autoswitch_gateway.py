@@ -35,6 +35,52 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("origin", ["oauth", "gateway"])
+    @pytest.mark.parametrize("phase", ["post", "state-lock"])
+    def test_gateway_replacement_is_not_quarantined_by_failed_oauth_refresh(self, temp_home, monkeypatch, origin, phase):
+        import json
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        if origin == "gateway":
+            s.switch_to("3", json_output=True)
+        email = s.account_email("2")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000}})
+        s._write_account_credentials("2", email, old)
+        path = temp_home / "failed-refresh-replacement.json"
+        export_accounts(s, str(path), account="2")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="gateway", credentials=KEY + "-replacement", baseUrl="https://replacement.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        armed, replaced = [], []
+        def replace_target():
+            if not replaced:
+                replaced.append(True)
+                import_accounts(s, str(path), force=True)
+        def refresh(*args, **kwargs):
+            armed.append(True)
+            if phase == "post":
+                replace_target()
+            return oauth.RefreshOutcome(None, "invalid_grant")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        state_lock = h.engine._state_lock
+        def race():
+            if phase == "state-lock" and armed:
+                replace_target()
+            return state_lock()
+        monkeypatch.setattr(h.engine, "_state_lock", race)
+        entries = readings(h, second=10, status="exhausted")
+        h.tick_with_entries(entries)
+        assert replaced
+        assert "2" not in h.state().get("quarantine", {})
+        entries["2"] = UsageEntry(sentinel="gateway", gateway=dict(probeStatus="ok", probedAt=h.clock(), budget=None))
+        assert h.tick_with_entries(entries) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert s.gateway_credential("2") == KEY + "-replacement"
+
     @pytest.mark.parametrize("phase", ["freshening", "pre-lock"])
     @pytest.mark.parametrize("target_kind,origin", [("oauth", "oauth"), ("oauth", "gateway"), ("gateway", "oauth")])
     def test_gateway_selection_rejects_replaced_target(self, temp_home, monkeypatch, phase, target_kind, origin):
