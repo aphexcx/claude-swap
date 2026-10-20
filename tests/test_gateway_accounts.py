@@ -62,6 +62,53 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("phase", ["before-claim", "during-probe"])
+    def test_gateway_probe_cannot_republish_after_oauth_replacement(self, gateway_switcher, temp_home, monkeypatch, phase):
+        from claude_swap.autoswitch import due_candidate
+        from claude_swap.usage_store import FetchRecord
+
+        s = gateway_switcher
+        s.add_account_from_token(KEY, slot=1, email="same@example.com", base_url="https://gateway.example")
+        s.add_account_from_token(KEY + "-b", slot=2, base_url="https://b.example")
+        s.switch_to("2", json_output=True)
+        path = temp_home / "replace.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="oauth", credentials={"claudeAiOauth": {"accessToken": "replacement-access", "refreshToken": "replacement-refresh", "expiresAt": 9999999999999}})
+        path.write_text(json.dumps(envelope))
+        replaced = []
+        def replace_target():
+            if not replaced:
+                replaced.append(True)
+                import_accounts(s, str(path), force=True)
+        snapshot = s.account_auth_snapshot
+        if phase == "before-claim":
+            def race(num, *args):
+                result = snapshot(num, *args)
+                if num == "1":
+                    replace_target()
+                return result
+            monkeypatch.setattr(s, "account_auth_snapshot", race)
+        else:
+            probe = gateway.probe
+            def race(record, key, **kwargs):
+                if record["email"] == "same@example.com":
+                    replace_target()
+                return probe(record, key, **kwargs)
+            monkeypatch.setattr(gateway, "probe", race)
+        s.usage_entries_by_account(fetch={"1"})
+        row = s._usage_store._read_rows().get("1", {})
+        assert "gateway" not in row and "gatewayFingerprint" not in row
+        entries = s.usage_entries_by_account(fetch=set())
+        assert due_candidate(["1"], entries, s._usage_store.clock()) == "1"
+        polled = []
+        def fetch(infos, pre):
+            polled.extend(str(i[0]) for i in infos)
+            return {str(i[0]): FetchRecord(usage={"five_hour": {"pct": 10}}) for i in infos}
+        monkeypatch.setattr(s, "_run_usage_fetches", fetch)
+        s.usage_entries_by_account(fetch={"1"})
+        assert polled == ["1"]
+
     @pytest.mark.parametrize("key", ["12345", "null", "true", "[]", '"opaque"',
         '{"claudeAiOauth":{"accessToken":"opaque","refreshToken":"opaque-refresh","expiresAt":9999999999999}}'])
     def test_gateway_json_shaped_keys_remain_opaque(self, gateway_switcher, temp_home, capsys, key):

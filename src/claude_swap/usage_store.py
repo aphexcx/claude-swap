@@ -28,6 +28,8 @@ batch, not one request.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import json
 import time
 import uuid
@@ -1006,11 +1008,13 @@ class UsageStore:
         *,
         active: bool,
         fetch: bool,
+        generation_guard=None,
     ) -> UsageEntry:
         """Gateway-only lease and cadence; OAuth's reserve/record are untouched."""
         import hashlib
         from claude_swap import gateway
 
+        guard = generation_guard or (lambda: nullcontext(True))
         now = self.clock()
         probe_config = {
             name: record.get(name)
@@ -1020,7 +1024,9 @@ class UsageStore:
             (key + json.dumps(probe_config, sort_keys=True)).encode()
         ).hexdigest()
         claim = None
-        with self._lock():
+        with guard() as valid, self._lock():
+            if not valid:
+                return UsageEntry()
             rows = self._read_rows()
             row = rows.get(num, {})
             if (
@@ -1070,7 +1076,9 @@ class UsageStore:
             if isinstance(budget, dict):
                 verdict["budget"] = budget
             deadline = gateway.next_probe_at(verdict, active=active, now=now)
-            with self._lock():
+            with guard() as valid, self._lock():
+                if not valid:
+                    return UsageEntry()
                 rows = self._read_rows()
                 row = rows.get(num, {})
                 if (
@@ -1089,11 +1097,14 @@ class UsageStore:
                     row.pop("claimUntil", None)
                     rows[num] = row
                     self._write_rows(rows)
-        entry = self.entries({num: identity})[num]
-        # A changed key must never inherit the preceding key's healthy verdict.
-        if self._read_rows().get(num, {}).get("gatewayFingerprint") != fingerprint:
-            return UsageEntry(sentinel="gateway")
-        return replace(entry, sentinel="gateway")
+        with guard() as valid:
+            if not valid:
+                return UsageEntry()
+            entry = self.entries({num: identity})[num]
+            # A changed key must never inherit the preceding key's healthy verdict.
+            if self._read_rows().get(num, {}).get("gatewayFingerprint") != fingerprint:
+                return UsageEntry(sentinel="gateway")
+            return replace(entry, sentinel="gateway")
 
     def _mutate(
         self,
