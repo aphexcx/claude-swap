@@ -4635,12 +4635,17 @@ class ClaudeAccountSwitcher:
         """Bind local probe claims/publication to the snapshot, never network I/O."""
         with FileLock(self.lock_file):
             current = (self._get_sequence_data() or {}).get("accounts", {}).get(number)
-            yield (
+            valid = (
                 current == record
                 and current.get("kind") == "gateway"
                 and (not self._account_write_pending(number) or not key)
-                and self._read_account_credentials(number, current["email"]) == key
             )
+            if valid:
+                current_key = self._read_account_credentials(number, current["email"])
+                # A missing read does not invalidate evidence from this
+                # generation. Only two different readable keys prove rotation.
+                valid = not key or not current_key or current_key == key
+            yield valid
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

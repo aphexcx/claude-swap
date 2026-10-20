@@ -1031,7 +1031,17 @@ class UsageStore:
             if not valid:
                 return UsageEntry()
             rows = self._read_rows()
-            row = dict(rows.get(num, {}))
+            stored_row = rows.get(num)
+            row = dict(stored_row) if isinstance(stored_row, dict) else {}
+            if (
+                "gatewayConfigFingerprint" not in row
+                and row.get("gatewayFingerprint") == config_fingerprint
+                and isinstance(row.get("gateway"), dict)
+                and row["gateway"].get("errorType") == "credential_unavailable"
+            ):
+                # Older rows hashed an empty key as if it were a credential.
+                # Normalize that known absence without restarting the outage.
+                row["gatewayFingerprint"] = None
             if (
                 not self._matches(row, identity)
                 or ("gatewayAuthGeneration" in row and row["gatewayAuthGeneration"] != record.get("authGeneration"))
