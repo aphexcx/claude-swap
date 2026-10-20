@@ -21,6 +21,31 @@ def seed_oauth(s):
 
 class TestGatewayActivation:
     @pytest.mark.parametrize("json_output", [False, True])
+    def test_gateway_status_rechecks_active_slot_before_live_capture(self, gateway_switcher, monkeypatch, capsys, json_output):
+        from claude_swap import oauth
+
+        s = gateway_switcher
+        seed_oauth(s)
+        s.add_account_from_token("sk-ant-oat01-second", slot=3)
+        for num in ("1", "3"):
+            value = json.dumps({"claudeAiOauth": {"accessToken": "access-" + num, "refreshToken": "refresh-" + num, "expiresAt": 9999999999999}})
+            s._write_account_credentials(num, s.account_email(num), value)
+        get_credentials_path().write_text(s._read_account_credentials("1", s.account_email("1")))
+        requests = []
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", lambda *args, **kwargs: requests.append(True) or oauth.UsageOutcome({"five_hour": {"pct": 10}}))
+        usage = s._active_account_usage
+        def race(*args, **kwargs):
+            s.switch_to("3", json_output=True)
+            return usage(*args, **kwargs)
+        monkeypatch.setattr(s, "_active_account_usage", race)
+        s.status(json_output=json_output)
+        capsys.readouterr()
+        assert s.current_account_number() == "3"
+        assert requests == []
+        assert "lastGood" not in s._usage_store._read_rows().get("1", {})
+        assert json.loads(get_credentials_path().read_text())["claudeAiOauth"]["refreshToken"] == "refresh-3"
+
+    @pytest.mark.parametrize("json_output", [False, True])
     @pytest.mark.parametrize("origin", ["oauth", "gateway"])
     def test_gateway_status_pins_captured_authentication(self, gateway_switcher, temp_home, monkeypatch, capsys, json_output, origin):
         from claude_swap import oauth

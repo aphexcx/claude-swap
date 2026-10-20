@@ -6346,7 +6346,11 @@ class ClaudeAccountSwitcher:
         """
         with FileLock(self.lock_file):
             record = (self._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
-            if record.get("email") != current_email or (record.get("organizationUuid") or "") != (org_uuid or ""):
+            if (
+                self.current_account_number() != account_num
+                or record.get("email") != current_email
+                or (record.get("organizationUuid") or "") != (org_uuid or "")
+            ):
                 return UsageEntry(sentinel=USAGE_NO_CREDENTIALS)
             self._record_active_verdict(None)
             if record.get("kind") == "gateway":
