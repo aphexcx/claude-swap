@@ -937,6 +937,8 @@ class AutoSwitchEngine:
                 # once the credential is replaced by a re-add).
                 return _FreshenFailure("identity-conflict", _refresh_fingerprint(outcome.credentials))
             return "ok"
+        if outcome.error == "identity-conflict":
+            return _FreshenFailure("identity-conflict", outcome.consumed_fp or _refresh_fingerprint(creds))
         if outcome.error in ("invalid_grant", "no_refresh_token"):
             return _FreshenFailure("invalid_grant", outcome.consumed_fp or _refresh_fingerprint(creds))
         if outcome.error in _SYSTEMIC_STATUSES:

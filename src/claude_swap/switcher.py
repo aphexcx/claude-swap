@@ -203,6 +203,9 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "identity-conflict": (
+        "refreshed credential belongs to another account — re-login and re-add this slot"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -313,6 +316,28 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+
+
+def _token_identity_conflicts(record: dict, token_account: dict | None) -> bool:
+    """Compare endpoint identity without acquiring locks or changing the roster."""
+    if not isinstance(token_account, dict):
+        return False
+    uuid = token_account.get("uuid")
+    if not isinstance(uuid, str) or not uuid.strip():
+        return False
+    org = token_account.get("organizationUuid")
+    slot_org = record.get("organizationUuid")
+    slot_uuid = (record.get("uuid") or "").strip()
+    return bool(
+        (isinstance(org, str) and org and slot_org and org != slot_org)
+        or (slot_uuid and slot_uuid != uuid.strip())
+    )
+
+
+class _StashedIdentityConflict(Exception):
+    def __init__(self, token_account: dict):
+        super().__init__("stashed successor belongs to another account")
+        self.token_account = token_account
 
 
 class _AccountInfo(tuple):
@@ -2439,6 +2464,9 @@ class ClaudeAccountSwitcher:
                 expected_generation = self._oauth_write_generation(account_num, email)
                 if expected_generation is None:
                     return oauth.RefreshOutcome(None, "transient")
+                expected_identity = dict(
+                    self._get_sequence_data()["accounts"][account_num]
+                )
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2459,6 +2487,11 @@ class ClaudeAccountSwitcher:
                 try:
                     adopted_creds = self._adopt_stashed_successor(
                         account_num, email, current
+                    )
+                except _StashedIdentityConflict as conflict:
+                    return oauth.RefreshOutcome(
+                        None, "identity-conflict", conflict.token_account,
+                        oauth.credential_fingerprint(current), stashed=True,
                     )
                 except CredentialReadError:
                     # The slot's only successor is unreadable. Deferring is
@@ -2628,6 +2661,10 @@ class ClaudeAccountSwitcher:
                     "fingerprint": oauth.credential_fingerprint(
                         result.credentials
                     ),
+                    "tokenAccount": {
+                        key: result.token_account.get(key)
+                        for key in ("uuid", "email", "organizationUuid")
+                    } if isinstance(result.token_account, dict) else None,
                 },
             )
             nonlocal stashed_reason
@@ -2636,6 +2673,7 @@ class ClaudeAccountSwitcher:
 
         outcome_creds = result.credentials
         outcome_identity = result.token_account
+        identity_conflict = _token_identity_conflicts(expected_identity, outcome_identity)
         try:
             try:
                 with FileLock(self.lock_file):
@@ -2643,6 +2681,13 @@ class ClaudeAccountSwitcher:
                         self._read_account_credentials_ex(account_num, email)
                     )
                     generation_changed = self._oauth_write_generation(account_num, email) != expected_generation
+                    if not generation_changed:
+                        # UUID backfill does not change authGeneration. Honor
+                        # identity learned during the POST even if the backup
+                        # became unreadable and the successor must be stashed.
+                        identity_conflict = identity_conflict or _token_identity_conflicts(
+                            self._get_sequence_data()["accounts"][account_num], outcome_identity
+                        )
                     if generation_changed and account_num in (self._get_sequence_data() or {}).get("accounts", {}):
                         stash_successor(
                             "consume-gate-account-replaced",
@@ -2690,6 +2735,12 @@ class ClaudeAccountSwitcher:
                         # The endpoint identity belongs to the stashed
                         # successor, not the racing credential we adopted.
                         outcome_identity = None
+                        identity_conflict = False
+                    elif identity_conflict:
+                        stash_successor(
+                            "consume-gate-identity-conflict",
+                            "Account %s's successor belongs to another account; stashed without adopting it.",
+                        )
                     else:
                         self._write_account_credentials(
                             account_num, email, result.credentials
@@ -2731,6 +2782,14 @@ class ClaudeAccountSwitcher:
                     "storage failure, then re-login and `cswap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
+        if identity_conflict:
+            # None of the consumers may use a known foreign token, even for
+            # one usage request. Keep its identity alongside the sole copy
+            # so a retry cannot silently adopt it as an ordinary successor.
+            return oauth.RefreshOutcome(
+                None, "identity-conflict", outcome_identity, consumed_fp,
+                stashed=bool(stashed_reason and stashed_reason != "consume-gate-unpersisted"),
+            )
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
             # generation whose grant we just spent. Callers read `error is
@@ -2814,6 +2873,8 @@ class ClaudeAccountSwitcher:
         # it and keep scanning; only defer via CredentialReadError once no
         # row adopted.
         deferred_entry_id: str | None = None
+        conflicting_identity: dict | None = None
+        slot_identity = (self._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
         manifest, manifest_verdict = self._store._read_stash_manifest_ex()
         if manifest_verdict == "unreadable" or (
             manifest_verdict == "corrupt"
@@ -2894,6 +2955,9 @@ class ClaudeAccountSwitcher:
                 continue
             creds, unreadable = self._store._read_unclaimed_credential(entry_id)
             if unreadable:
+                if _token_identity_conflicts(slot_identity, meta.get("tokenAccount")):
+                    conflicting_identity = meta["tokenAccount"]
+                    continue
                 # This entry is the SOLE copy of a generation a prior gate
                 # pass already consumed and could not persist. Falling
                 # through here would make the caller POST the slot's
@@ -2919,6 +2983,11 @@ class ClaudeAccountSwitcher:
                     "generation is gone, so no pass could ever adopt it.",
                     account_num,
                 )
+                continue
+            if _token_identity_conflicts(slot_identity, meta.get("tokenAccount")):
+                # Preserve this entry, but still allow a healthy sibling on
+                # the same predecessor to recover the slot.
+                conflicting_identity = meta["tokenAccount"]
                 continue
             # The WRAPPER, not the store method plus a private repeat of its
             # tail: `_write_account_credentials` already contains the
@@ -2949,6 +3018,8 @@ class ClaudeAccountSwitcher:
                 "is unreadable; deferring adoption rather than discarding "
                 "its generation"
             )
+        if conflicting_identity is not None:
+            raise _StashedIdentityConflict(conflicting_identity)
         return None
 
     def _record_active_verdict(self, active) -> None:

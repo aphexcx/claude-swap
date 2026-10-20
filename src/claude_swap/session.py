@@ -770,6 +770,10 @@ class SessionManager:
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
+            if outcome.error == "identity-conflict":
+                raise SessionError(
+                    "Refreshed credential belongs to another account; re-login and re-add this slot."
+                )
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by
