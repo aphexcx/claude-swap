@@ -547,6 +547,15 @@ class TickOutcome(enum.Enum):
     BLOCKED = 3  # wanted to switch but no viable target / all exhausted
 
 
+class _FreshenFailure(str):
+    """A status string bound to the exact token generation that failed."""
+
+    def __new__(cls, status: str, fingerprint: str | None):
+        result = super().__new__(cls, status)
+        result.fingerprint = fingerprint
+        return result
+
+
 # Quarantine state persisted fingerprints from a local refresh-token-only
 # helper; oauth.credential_fingerprint is identical for refresh-token creds.
 # Setup-token quarantines stored None where the shared helper now yields a
@@ -804,7 +813,7 @@ class AutoSwitchEngine:
 
     # -- quarantine -----------------------------------------------------------
 
-    def _quarantine(self, number: str, email: str, reason: str, *, expected_auth: dict | None = None) -> None:
+    def _quarantine(self, number: str, email: str, reason: str, *, expected_auth: dict | None = None, expected_fingerprint: str | None = None) -> None:
         # Match switch commit order: state, then roster. Publication and the
         # credential fingerprint must refer to the generation that failed.
         with self._state_lock(), FileLock(self.switcher.lock_file):
@@ -813,6 +822,8 @@ class AutoSwitchEngine:
                 return
             creds = self.switcher.read_account_credentials(number, email)
             fingerprint = _refresh_fingerprint(creds) if creds else None
+            if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+                return
             state = self._read_state()
             state["schemaVersion"] = STATE_SCHEMA_VERSION
             state.setdefault("quarantine", {})[number] = {
@@ -898,7 +909,7 @@ class AutoSwitchEngine:
             return "transient"
         data = oauth.extract_oauth_data(creds)
         if not data:
-            return "invalid_grant"
+            return _FreshenFailure("invalid_grant", _refresh_fingerprint(creds))
         expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
         near_expiry = (
@@ -924,10 +935,10 @@ class AutoSwitchEngine:
                 # account with every gauge reading normal. Not a viable
                 # target; the caller quarantines it (released automatically
                 # once the credential is replaced by a re-add).
-                return "identity-conflict"
+                return _FreshenFailure("identity-conflict", _refresh_fingerprint(outcome.credentials))
             return "ok"
         if outcome.error in ("invalid_grant", "no_refresh_token"):
-            return "invalid_grant"
+            return _FreshenFailure("invalid_grant", outcome.consumed_fp or _refresh_fingerprint(creds))
         if outcome.error in _SYSTEMIC_STATUSES:
             # Deterministic conditions, not network trouble: every candidate
             # refuses identically and keeps refusing until something outside
@@ -1722,7 +1733,8 @@ class AutoSwitchEngine:
         if status in ("identity-conflict", "invalid_grant"):
             # Freshening may already have persisted a foreign successor.
             # Fingerprint that generation so it stays excluded next tick.
-            self._quarantine(number, email, status, expected_auth=expected_auth)
+            self._quarantine(number, email, str(status), expected_auth=expected_auth,
+                             expected_fingerprint=getattr(status, "fingerprint", None))
         return status
 
     @staticmethod
