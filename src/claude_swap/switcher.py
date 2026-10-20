@@ -7719,6 +7719,7 @@ class ClaudeAccountSwitcher:
     @contextmanager
     def _gateway_settings_transaction(
         self, target: str, *, provenance: dict, emit_output: bool, warnings_out: list,
+        force_activate: bool,
     ):
         """Runs inside all three switch locks; undo the exact prior settings."""
         data = self._get_sequence_data() or {}
@@ -7768,7 +7769,12 @@ class ClaudeAccountSwitcher:
             if is_gateway:
                 if source is None:
                     self._clear_gateway_replacement_flags(data)
-                if source is None and source_num is not None and accounts[source_num].get("kind", "oauth") == "oauth":
+                if (
+                    not force_activate
+                    and source is None
+                    and source_num is not None
+                    and accounts[source_num].get("kind", "oauth") == "oauth"
+                ):
                     live = self._read_credentials()
                     # A missing OAuth login is itself a reason to recover
                     # onto the gateway; activation never replaces that store.
@@ -7965,6 +7971,7 @@ class ClaudeAccountSwitcher:
             self._gateway_settings_transaction(
                 target_account, provenance=provenance,
                 emit_output=emit_output, warnings_out=warnings_out,
+                force_activate=force_activate,
             ) as gateway_switch,
         ):
             data = self._get_sequence_data()
