@@ -4588,6 +4588,18 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data() or {}
             return {num: self._switch_target_snapshot(data, num) for num in data.get("accounts", {})}
 
+    @contextmanager
+    def _gateway_probe_generation(self, number: str, record: dict, key: str):
+        """Bind local probe claims/publication to the snapshot, never network I/O."""
+        with FileLock(self.lock_file):
+            current = (self._get_sequence_data() or {}).get("accounts", {}).get(number)
+            yield (
+                current == record
+                and current.get("kind") == "gateway"
+                and (not self._account_write_pending(number) or not key)
+                and self._read_account_credentials(number, current["email"]) == key
+            )
+
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
@@ -5672,6 +5684,7 @@ class ClaudeAccountSwitcher:
                     key,
                     active=info[4],
                     fetch=fetch is None or num in fetch,
+                    generation_guard=lambda: self._gateway_probe_generation(num, record, key),
                 )
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
