@@ -20,6 +20,106 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("operation", ["adopt", "consume"])
+    def test_gateway_rejects_stale_oauth_persistence_entry(self, gateway_switcher, monkeypatch, operation):
+        from claude_swap import oauth
+
+        s = gateway_switcher
+        key = json.dumps({"claudeAiOauth": {"accessToken": "opaque-access", "refreshToken": "opaque-refresh", "expiresAt": 1000}})
+        s.add_account_from_token(key, slot=1, base_url="https://gateway.example")
+        email = s.account_email("1")
+        def unexpected(*args, **kwargs):
+            pytest.fail("Gateway credential reached an OAuth persistence path")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", unexpected)
+        monkeypatch.setattr(s, "_session_profile_ahead", unexpected)
+        if operation == "adopt":
+            assert s._adopt_session_credential("1", email, "") is None
+        else:
+            assert s.consume_backup_grant("1", email, key).error == "transient"
+        assert s._read_account_credentials("1", email) == key
+
+    @pytest.mark.parametrize("phase", ["usage", "profile", "pre-lock"])
+    @pytest.mark.parametrize("replacement_kind", ["gateway", "oauth"])
+    def test_gateway_replacement_survives_inflight_oauth_collection(self, gateway_switcher, temp_home, monkeypatch, phase, replacement_kind):
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s.account_email("1")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000}})
+        live = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials("1", email, old)
+        get_credentials_path().write_text(old if phase == "pre-lock" else live)
+        path = temp_home / "concurrent.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        row = envelope["accounts"][0]
+        if replacement_kind == "gateway":
+            row.update(kind="gateway", credentials=KEY, baseUrl="https://replacement.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        else:
+            row["credentials"] = {"claudeAiOauth": {"accessToken": "imported-access", "refreshToken": "imported-refresh", "expiresAt": 1000}}
+        path.write_text(json.dumps(envelope))
+        replacement = []
+        def replace_slot():
+            if not replacement:
+                replacement.append(True)
+                import_accounts(s, str(path), force=True)
+                replacement.append(s._read_account_credentials("1", email))
+        def usage(*args, **kwargs):
+            if phase == "usage":
+                replace_slot()
+            return oauth.UsageOutcome({"five_hour": {"pct": 10}})
+        def profile(*args):
+            if phase == "profile":
+                replace_slot()
+            return {"uuid": "self-uuid", "email": email, "organizationUuid": ""}
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", usage)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", profile)
+        refreshes = []
+        def refresh(*args, **kwargs):
+            refreshes.append(True)
+            return oauth.RefreshOutcome(live, None)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        if phase == "pre-lock":
+            read = s._read_account_credentials
+            def read_then_replace(num, address):
+                value = read(num, address)
+                if num == "1":
+                    replace_slot()
+                return value
+            monkeypatch.setattr(s, "_read_account_credentials", read_then_replace)
+        s._fetch_active_usage("1", email, old if phase == "pre-lock" else live)
+        assert replacement
+        assert s._read_account_credentials("1", email) == replacement[1]
+        assert not refreshes
+
+    @pytest.mark.parametrize("key_shape", ["raw", "oauth-shaped"])
+    def test_gateway_replacement_during_refresh_stashes_successor(self, gateway_switcher, temp_home, monkeypatch, key_shape):
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s.account_email("1")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000}})
+        successor = json.dumps({"claudeAiOauth": {"accessToken": "successor-access", "refreshToken": "successor-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials("1", email, old)
+        path = temp_home / "during-refresh.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        key = KEY if key_shape == "raw" else old
+        envelope["accounts"][0].update(kind="gateway", credentials=key, baseUrl="https://replacement.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        def refresh(*args, **kwargs):
+            import_accounts(s, str(path), force=True)
+            return oauth.RefreshOutcome(successor, None)
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        result = s.consume_backup_grant("1", email, old)
+        assert s._read_account_credentials("1", email) == key
+        assert result.error == "transient" and result.stashed
+        assert any(s._store._read_unclaimed_credential(i) == (successor, False) for i in s.list_unclaimed_credentials())
+
     @pytest.mark.parametrize("operation", ["import", "add-token"])
     def test_gateway_replacement_refuses_unreadable_retained_live_before_writes(self, gateway_switcher, temp_home, monkeypatch, operation):
         from claude_swap.exceptions import CredentialReadError

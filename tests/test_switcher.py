@@ -752,6 +752,16 @@ class TestFetchAccountUsageSessionProfile:
     def _info(self, backup_creds: str) -> tuple:
         return (2, "test@example.com", "Org", "org-uuid", False, backup_creds, "")
 
+    @pytest.fixture(autouse=True)
+    def _managed_slot(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "sequence": [2], "accounts": {"2": {
+                "email": "test@example.com", "organizationUuid": "org-uuid",
+            }},
+        })
+
     def test_fresh_session_credentials_fetch_read_only(self, temp_home: Path):
         """Profile creds are used with is_active=True (no refresh, no persist)."""
         switcher = ClaudeAccountSwitcher()
@@ -1249,6 +1259,11 @@ class TestAdoptSessionCredential:
     def _switcher(self, backup: str) -> ClaudeAccountSwitcher:
         switcher = ClaudeAccountSwitcher()
         switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "sequence": [2], "accounts": {"2": {
+                "email": self.EMAIL, "organizationUuid": "org-uuid",
+            }},
+        })
         switcher._write_account_credentials("2", self.EMAIL, backup)
         return switcher
 
@@ -10487,6 +10502,7 @@ class TestStoreResolutionParity:
         self, temp_home: Path, sample_sequence_data: dict, monkeypatch
     ):
         monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         s = ClaudeAccountSwitcher()
         s._setup_directories()
         s._write_json(s.sequence_file, sample_sequence_data)
