@@ -7,7 +7,7 @@ import pytest
 from claude_swap import gateway
 from claude_swap.autoswitch import AutoSwitchEngine, ConfigWarningEvent, NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.usage_store import FetchRecord, UsageEntry
-from tests.test_autoswitch import EngineHarness, _entry_for, _usage
+from tests.test_autoswitch import EngineHarness, _entry_for, _iso_at, _usage
 from tests.test_gateway_accounts import KEY
 
 
@@ -563,19 +563,61 @@ class TestAutoswitchGateway:
         assert h.active_number() == 2
         assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == [reason]
 
-    def test_failed_gateway_return_requires_margin_but_ignores_cooldown(
-        self, temp_home, monkeypatch
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    @pytest.mark.parametrize("status,extra", [
+        ("exhausted", {}),
+        ("unauthorized", {}),
+        ("cooling", {"coolingSince": 999000}),
+        ("transient", {"transientSince": 999000}),
+    ])
+    def test_failed_gateway_can_escape_without_return_margin(
+        self, temp_home, monkeypatch, strategy, status, extra
     ):
-        h = fleet(temp_home, monkeypatch)
+        h = fleet(temp_home, monkeypatch, strategy=strategy)
         h.switcher.switch_to("3", json_output=True)
         h.engine._mutate_state(lambda state: state.update(lastSwitchAt=h.clock()))
         assert (
-            h.tick_with_entries(readings(h, second=85, status="exhausted"))
-            == TickOutcome.BLOCKED
+            h.tick_with_entries(readings(h, second=85, status=status, **extra))
+            == TickOutcome.SWITCHED
         )
-        assert h.active_number() == 3
-        assert h.tick_with_entries(readings(h, second=75, status="exhausted")) == TickOutcome.SWITCHED
         assert h.active_number() == 2
+        assert [e.trigger for e in h.events if isinstance(e, SwitchEvent)] == ["gateway-" + status]
+
+    @pytest.mark.parametrize("strategy", ["best", "consume-first"])
+    @pytest.mark.parametrize("preferred_freshens", [True, False])
+    def test_failed_gateway_prefers_margin_then_tries_under_line(
+        self, temp_home, monkeypatch, strategy, preferred_freshens
+    ):
+        h = fleet(temp_home, monkeypatch, strategy=strategy)
+        h.switcher.switch_to("3", json_output=True)
+        entries = readings(h, first=85, second=75, status="exhausted")
+        # The inside-band account resets sooner: margin preference must precede
+        # consume-first's usual weekly-reset ranking, without excluding it.
+        entries["1"].last_good["seven_day"]["resets_at"] = _iso_at(h.clock() + 3600)
+        entries["2"].last_good["seven_day"]["resets_at"] = _iso_at(h.clock() + 7200)
+        attempted = []
+
+        def freshen(number, email):
+            attempted.append(number)
+            return "transient" if number == "2" and not preferred_freshens else "ok"
+
+        monkeypatch.setattr(h.engine, "_freshen_target", freshen)
+        assert h.tick_with_entries(entries) == TickOutcome.SWITCHED
+        assert h.active_number() == (2 if preferred_freshens else 1)
+        assert attempted == (["2"] if preferred_freshens else ["2", "1"])
+
+    @pytest.mark.parametrize("second", [90, 95])
+    def test_failed_gateway_holds_when_every_oauth_seat_reaches_its_line(
+        self, temp_home, monkeypatch, second
+    ):
+        h = fleet(temp_home, monkeypatch)
+        h.switcher.switch_to("3", json_output=True)
+        assert h.tick_with_entries(readings(h, first=90, second=second, status="exhausted")) == TickOutcome.BLOCKED
+        assert h.active_number() == 3
+        holds = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert [(e.reason, e.detail) for e in holds] == [
+            ("gateway-exhausted", "no eligible fallback account; holding gateway")
+        ]
 
     def test_gateway_does_not_hide_oauth_model_warning(self, temp_home, monkeypatch):
         h = fleet(temp_home, monkeypatch)
