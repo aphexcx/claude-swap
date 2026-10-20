@@ -34,6 +34,50 @@ def respond(monkeypatch, status, message="", retry=None):
 
 
 class TestGatewayProbe:
+    @pytest.mark.parametrize("status", [401, 500, 503])
+    def test_gateway_read_failures_preserve_failure_generation(self, temp_home, monkeypatch, status):
+        now = [1000.0]
+        store = UsageStore(temp_home / "cache", clock=lambda: now[0])
+        record = dict(gateway.account_fields("https://gateway.example"), authGeneration="original")
+        monkeypatch.setattr(gateway, "JITTER_FRAC", 0)
+        opener = respond(monkeypatch, status)
+        def collect(key):
+            return store.collect_gateway("1", ("gw@example.com", ""), record, key, active=True, fetch=True)
+        first = collect(KEY)
+        for key in ("", KEY, "", KEY):
+            now[0] += 601
+            entry = collect(key)
+            if status == 401:
+                assert entry.gateway["probeStatus"] == "unauthorized"
+                assert opener.open.call_count == 1
+            else:
+                assert entry.gateway["failureSince"] == first.gateway["failureSince"] == 1000
+        now[0] += 601
+        # An actual credential replacement starts a distinct failure history.
+        replaced = collect(KEY + "-replacement")
+        if status == 401:
+            assert opener.open.call_count == 2
+        else:
+            assert replaced.gateway["failureSince"] == now[0]
+        now[0] += 601
+        record["authGeneration"] = "explicit-replacement"
+        replaced = collect(KEY + "-replacement")
+        if status == 401:
+            assert opener.open.call_count == 3
+        else:
+            assert replaced.gateway["failureSince"] == now[0]
+
+    def test_gateway_first_read_recovery_preserves_continuous_failure(self, temp_home, monkeypatch):
+        now = [1000.0]
+        store = UsageStore(temp_home / "cache", clock=lambda: now[0])
+        record = dict(gateway.account_fields("https://gateway.example"), authGeneration="original")
+        monkeypatch.setattr(gateway, "JITTER_FRAC", 0)
+        respond(monkeypatch, 500)
+        first = store.collect_gateway("1", ("gw@example.com", ""), record, "", active=True, fetch=True)
+        now[0] += 601
+        recovered_read = store.collect_gateway("1", ("gw@example.com", ""), record, KEY, active=True, fetch=True)
+        assert recovered_read.gateway["failureSince"] == first.gateway["failureSince"] == 1000
+
     def test_transient_since_persists_and_resets_after_recovery(self, monkeypatch):
         record = gateway.account_fields("https://gateway.example")
         respond(monkeypatch, 500)
