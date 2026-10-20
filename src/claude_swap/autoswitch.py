@@ -1738,7 +1738,6 @@ class AutoSwitchEngine:
                 usage.get(n),
                 thresholds[n],
                 settings,
-                margin=settings.hysteresis_pct,
             )
         ]
         ordered, _, _ = self._rank_candidates(
@@ -1754,6 +1753,12 @@ class AutoSwitchEngine:
             now=self.clock(),
             thresholds=thresholds,
         )
+        # A failed gateway must yield to any OAuth seat under its own lines.
+        # Prefer seats clearing the margin, retaining strategy order within
+        # each group and the inside-band fallbacks if freshening fails.
+        ordered.sort(key=lambda n: not self._gateway_oauth_eligible(
+            usage.get(n), thresholds[n], settings, margin=settings.hysteresis_pct,
+        ))
         trigger = failure
         if settings.include_api_key_accounts:
             ordered += [

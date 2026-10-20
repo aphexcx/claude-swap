@@ -417,9 +417,10 @@ about every ten minutes. A 429 marks exhaustion, 503/529 marks cooling, and
 401/403 quarantines the credential until it is replaced with `add-token`.
 The loop stays on the gateway until it reports exhaustion or unauthorized
 credentials, or cooling/transient failure lasts ten minutes. OAuth accounts
-keep being polled while it holds. On departure, an OAuth account must be below
-its own threshold by the hysteresis margin; recovery alone never triggers a
-return. If no eligible alternative exists, it holds the current seat.
+keep being polled while it holds. On departure, OAuth accounts below their own
+thresholds by the hysteresis margin are preferred, then any OAuth account under
+its own limits. Recovery alone never triggers a return. If no eligible
+alternative exists, it holds the current seat.
 
 Switching writes only a cswap `apiKeyHelper` command and gateway environment
 settings to Claude Code's `settings.json`. The key remains in cswap's credential
