@@ -861,11 +861,11 @@ class SessionManager:
                     session_dir, account_num, email
                 ) and profile_is_quiescent(session_dir):
                     self._bootstrap(session_dir, account_num, email, org_uuid)
-                self._sync_sharing(session_dir, share, share_history)
+                self._sync_sharing(session_dir, share, share_history, locked=True)
                 return session_dir, account_num, email
 
             self._bootstrap(session_dir, account_num, email, org_uuid)
-            self._sync_sharing(session_dir, share, share_history)
+            self._sync_sharing(session_dir, share, share_history, locked=True)
 
             verdict = self._session_validity(session_dir, email, org_uuid)
             # NEITHER probe-failure verdict may reach `_cleanup_failed_session`
@@ -1176,6 +1176,17 @@ class SessionManager:
 
     def _sync_sharing(
         self, session_dir: Path, share: bool, share_history: bool = False,
+        *, gateway_session: bool = False, locked: bool = False,
+    ) -> None:
+        """Serialize sharing decisions and publication with gateway activation."""
+        if not locked:
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._sync_sharing_locked(session_dir, share, share_history, gateway_session=gateway_session)
+            return
+        self._sync_sharing_locked(session_dir, share, share_history, gateway_session=gateway_session)
+
+    def _sync_sharing_locked(
+        self, session_dir: Path, share: bool, share_history: bool = False,
         *, gateway_session: bool = False,
     ) -> None:
         """Mirror shared items from ~/.claude into the profile (or undo it).
@@ -1188,10 +1199,10 @@ class SessionManager:
         Idempotent; runs on every launch. Deliberately sources from the
         default ``~/.claude`` (not ``get_claude_config_home()``): sharing
         always mirrors the default profile, even when ``CLAUDE_CONFIG_DIR``
-        is set in the invoking environment. File/dir sharing is lock-free on
-        the reuse path — concurrent runs with different flags are last-writer-
-        wins and self-heal on the next launch; only the MCP mirror takes
-        Claude's config lock, and only when it needs to write.
+        is set in the invoking environment. The caller holds the roster lock
+        through settings isolation decisions and publication so activation
+        cannot be undone by a stale sharing decision. The MCP mirror also
+        takes Claude's config lock when it needs to write, in that order.
         """
         if not session_dir.is_dir():
             return
