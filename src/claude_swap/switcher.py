@@ -6352,13 +6352,18 @@ class ClaudeAccountSwitcher:
         collector, so freshness/backoff/claim gating and the shared
         ``cache/usage.json`` table behave exactly as in ``--list``.
         """
-        if self._account_kind(account_num) == "gateway":
-            creds = self._read_account_credentials(account_num, current_email)
-        else:
-            active = self._read_active_credentials()
-            creds = active.value or ""
-            self._record_active_verdict(active)
-        info = (int(account_num), current_email, "", org_uuid or "", True, creds, "")
+        with FileLock(self.lock_file):
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(account_num, {})
+            if record.get("email") != current_email or (record.get("organizationUuid") or "") != (org_uuid or ""):
+                return UsageEntry(sentinel=USAGE_NO_CREDENTIALS)
+            self._record_active_verdict(None)
+            if record.get("kind") == "gateway":
+                creds = self._read_account_credentials(account_num, current_email)
+            else:
+                active = self._read_active_credentials()
+                creds = active.value or ""
+                self._record_active_verdict(active)
+            info = _AccountInfo((int(account_num), current_email, "", org_uuid or "", True, creds, ""), record)
         return self._collect_usage_entries([info])[str(account_num)]
 
     def _build_status_payload(self) -> dict:

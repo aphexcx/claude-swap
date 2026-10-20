@@ -20,6 +20,46 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    @pytest.mark.parametrize("json_output", [False, True])
+    @pytest.mark.parametrize("origin", ["oauth", "gateway"])
+    def test_gateway_status_pins_captured_authentication(self, gateway_switcher, temp_home, monkeypatch, capsys, json_output, origin):
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        num = "2" if origin == "gateway" else "1"
+        email = s.account_email(num)
+        captured = json.dumps({"claudeAiOauth": {"accessToken": "captured-access", "refreshToken": "captured-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials(num, email, captured)
+        if origin == "gateway":
+            s.switch_to(num, json_output=True)
+        else:
+            get_credentials_path().write_text(captured)
+        path = temp_home / "status-replacement.json"
+        export_accounts(s, str(path), account=num)
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="oauth", credentials={"claudeAiOauth": {"accessToken": "replacement-access", "refreshToken": "replacement-refresh", "expiresAt": 9999999999999}})
+        path.write_text(json.dumps(envelope))
+        requests, replaced = [], []
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", lambda *args, **kwargs: requests.append(True) or oauth.UsageOutcome({"five_hour": {"pct": 10}}))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *args: {"uuid": "self-uuid", "email": email, "organizationUuid": ""})
+        collect = s._collect_usage_entries
+        def race(*args, **kwargs):
+            if not replaced:
+                replaced.append(True)
+                if origin == "gateway":
+                    s.switch_to("1", json_output=True)
+                import_accounts(s, str(path), force=True)
+            return collect(*args, **kwargs)
+        monkeypatch.setattr(s, "_collect_usage_entries", race)
+        s.status(json_output=json_output)
+        capsys.readouterr()
+        assert replaced
+        assert requests == []
+        assert "lastGood" not in s._usage_store._read_rows().get(num, {})
+        assert json.loads(s._read_account_credentials(num, email))["claudeAiOauth"]["refreshToken"] == "replacement-refresh"
+
     def test_gateway_usage_routing_keeps_captured_active_generation(self, gateway_switcher, temp_home, monkeypatch):
         from claude_swap import oauth
         from claude_swap.transfer import export_accounts, import_accounts
