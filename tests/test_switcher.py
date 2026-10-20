@@ -4378,17 +4378,32 @@ class TestSwitchToSelfSlotAndForce:
         assert data["activeAccountNumber"] == 1
         assert "Activated" in capsys.readouterr().out
 
+    @pytest.mark.parametrize("target_kind", ["oauth", "gateway"])
     def test_force_cross_slot_skips_backup_of_current(
         self,
         temp_home: Path,
         mock_claude_config: Path,
         sample_sequence_data: dict,
+        monkeypatch,
+        target_kind,
     ):
         """--switch-to 2 --force lands on account 2 without writing the stale
         live creds into slot 1's freshly imported backup."""
         switcher, creds, configs, live = self._post_import_state(
             temp_home, sample_sequence_data,
         )
+        if target_kind == "gateway":
+            from claude_swap import gateway
+            from tests.test_gateway_accounts import KEY
+
+            monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+            data = switcher._get_sequence_data()
+            data["accounts"]["2"].update(
+                kind="gateway", baseUrl="https://gateway.example", auth="bearer",
+                probeModel=gateway.DEFAULT_MODEL,
+            )
+            switcher._write_json(switcher.sequence_file, data)
+            creds[("2", "account2@example.com")] = KEY
         patches = self._install_store_patches(switcher, creds, configs, live)
         try:
             switcher.switch_to("2", force=True)
@@ -4397,7 +4412,13 @@ class TestSwitchToSelfSlotAndForce:
                 p.stop()
 
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
-        assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
+        if target_kind == "gateway":
+            assert live["creds"] == self.LIVE_1
+            assert gateway.active_slot(
+                switcher._gateway_settings_path(), switcher._get_sequence_data()["accounts"],
+            ) == "2"
+        else:
+            assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-2"
         data = switcher._get_sequence_data()
         assert data["activeAccountNumber"] == 2
 
