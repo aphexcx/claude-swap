@@ -7312,6 +7312,11 @@ class ClaudeAccountSwitcher:
             except (TypeError, ValueError):
                 stored_newer = False
             if stored_newer and stored.get("accessToken"):
+                if kind == "unresolved":
+                    # Expiry orders generations, but cannot prove this live
+                    # login belongs to the slot. Preserve its only copy before
+                    # activating the newer backup, as for explicit replacement.
+                    return ("stored-replacement", None)
                 return ("stored-newer", None)
         return kind, foreign_slot
 
