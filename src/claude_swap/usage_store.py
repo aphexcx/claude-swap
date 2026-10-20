@@ -1023,17 +1023,32 @@ class UsageStore:
         fingerprint = hashlib.sha256(
             (key + json.dumps(probe_config, sort_keys=True)).encode()
         ).hexdigest()
+        config_fingerprint = hashlib.sha256(
+            json.dumps(probe_config, sort_keys=True).encode()
+        ).hexdigest()
         claim = None
         with guard() as valid, self._lock():
             if not valid:
                 return UsageEntry()
             rows = self._read_rows()
-            row = rows.get(num, {})
+            row = dict(rows.get(num, {}))
             if (
                 not self._matches(row, identity)
-                or row.get("gatewayFingerprint") != fingerprint
+                or ("gatewayAuthGeneration" in row and row["gatewayAuthGeneration"] != record.get("authGeneration"))
+                or ("gatewayConfigFingerprint" in row and row["gatewayConfigFingerprint"] != config_fingerprint)
+                or (key and row.get("gatewayFingerprint") not in (None, fingerprint))
             ):
                 row = self._fresh_row(identity)
+            # A failed credential read is not a replacement. Retain the last
+            # readable key's fingerprint and failure history until a readable
+            # key, explicit generation or probe configuration actually changes.
+            # With no prior readable key, the first read keeps the outage clock.
+            fingerprint = fingerprint if key else row.get("gatewayFingerprint")
+            row.update(
+                gatewayFingerprint=fingerprint,
+                gatewayAuthGeneration=record.get("authGeneration"),
+                gatewayConfigFingerprint=config_fingerprint,
+            )
             prior = row.get("gateway", {})
             due = row.get("nextPollAt", 0)
             if (
@@ -1045,8 +1060,6 @@ class UsageStore:
                 # The loop consumes the persisted deadline even when this
                 # read is too early to probe. Publish the promoted cadence.
                 row.update(nextPollAt=due, gatewayActive=True)
-                rows[num] = row
-                self._write_rows(rows)
             if (
                 fetch
                 and prior.get("probeStatus") != "unauthorized"
@@ -1059,6 +1072,7 @@ class UsageStore:
                     gatewayClaim=claim,
                     claimUntil=now + CLAIM_TTL_S,
                 )
+            if row != rows.get(num):
                 rows[num] = row
                 self._write_rows(rows)
         if claim:
