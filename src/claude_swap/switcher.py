@@ -6911,6 +6911,7 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        skipped_gateway = False
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
@@ -6937,6 +6938,7 @@ class ClaudeAccountSwitcher:
                 status = verdict.get("probeStatus")
                 if status in ("exhausted", "unauthorized"):
                     skipped_exhausted.append(candidate)
+                    skipped_gateway = True
                     if json_output:
                         warnings.append(f"Skipped Account-{candidate} (gateway {status})")
                     else:
@@ -6972,8 +6974,12 @@ class ClaudeAccountSwitcher:
         # account would not help, so stay on the current one instead.
         if next_account is None and skipped_exhausted:
             # With model limits in play the binding window may be a scoped
-            # one (the per-skip lines name it), so don't claim "5h/7d".
-            limits_label = "usage limits" if models else "5h/7d limit"
+            # one (the per-skip lines name it), so don't claim "5h/7d"; a
+            # failing gateway has no windows at all.
+            limits_label = (
+                "limits or unavailable" if skipped_gateway
+                else "usage limits" if models else "5h/7d limit"
+            )
             if json_output:
                 return self._switch_noop(
                     strategy=strategy_label, reason="candidates-exhausted",
