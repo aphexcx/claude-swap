@@ -421,7 +421,7 @@ The loop stays on the gateway until it reports exhaustion or unauthorized
 credentials, or cooling/transient failure lasts ten minutes. OAuth accounts
 keep being polled while it holds. On departure, OAuth accounts below their own
 thresholds by the hysteresis margin are preferred, then any OAuth account under
-its own limits. Recovery alone never triggers a return. If no eligible
+its own threshold. Recovery alone never triggers a return. If no eligible
 alternative exists, it holds the current seat.
 
 Switching writes only a cswap `apiKeyHelper` command and gateway environment

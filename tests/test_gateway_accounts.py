@@ -93,6 +93,30 @@ class TestGatewayAccounts:
             message = f"Account-2 (gateway {reason})"
             assert message in (" ".join(result["warnings"]) if json_output else output)
 
+    @pytest.mark.parametrize("json_output", [False, True])
+    def test_next_available_names_failing_gateway_without_window_limits(
+        self, gateway_switcher, monkeypatch, capsys, json_output
+    ):
+        from tests.test_gateway_probe import respond
+
+        s = gateway_switcher
+        s.add_account_from_token("sk-ant-oat01-first", slot=1)
+        s.switch_to("1", json_output=True)
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=2)
+        monkeypatch.setattr(gateway, "probe", real_gateway_probe)
+        respond(monkeypatch, 401)
+        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre: {})
+        result = s.switch(strategy="next-available", json_output=json_output)
+        assert s.current_account_number() == "1"
+        message = "All other accounts are at their limits or unavailable — staying on Account-1."
+        if json_output:
+            assert result["reason"] == "candidates-exhausted"
+            assert result["message"] == message
+        else:
+            output = capsys.readouterr()
+            assert message in output.out + output.err
+            assert "5h/7d" not in output.out + output.err
+
     @pytest.mark.parametrize("view", ["json-list", "dashboard"])
     def test_gateway_rendering_uses_one_metadata_snapshot(self, gateway_switcher, temp_home, monkeypatch, view):
         from claude_swap import oauth
