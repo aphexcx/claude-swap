@@ -3047,6 +3047,58 @@ def test_manifest_interrupted_mid_write_leaves_no_temp(tmp_path: Path, monkeypat
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_gateway_activation_cannot_relink_reused_oauth_session(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed, refresh_rotates,
+):
+    import threading
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"kept"}')
+    profile, _, _ = manager.setup_session("2", share=True)
+    assert (profile / "settings.json").is_symlink()
+    finished = threading.Event()
+    errors, threads, calls = [], [], []
+    def activate():
+        try:
+            s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+            s.switch_to("7", json_output=True)
+        except BaseException as exc:
+            errors.append(type(exc).__name__)
+        finally:
+            finished.set()
+    has_gateway = manager._has_gateway_accounts
+    def race():
+        result = has_gateway()
+        calls.append(True)
+        if len(calls) == 2:
+            worker = threading.Thread(target=activate)
+            threads.append(worker)
+            worker.start()
+            # Old sharing allows activation to finish here, then publishes
+            # its stale symlink decision. Locked sharing makes it wait.
+            finished.wait(0.5)
+        return result
+    monkeypatch.setattr(manager, "_has_gateway_accounts", race)
+    try:
+        with pytest.raises(_ExecCalled):
+            manager.run("2", [], share=True)
+    finally:
+        for worker in threads:
+            worker.join(timeout=5)
+    assert threads and finished.is_set()
+    assert errors == []
+    assert s.current_account_number() == "7"
+    assert not (profile / "settings.json").is_symlink()
+    settings = json.loads((profile / "settings.json").read_text())
+    assert settings["theme"] == "kept"
+    assert "apiKeyHelper" not in settings
+    assert settings.get("env", {}).get("ANTHROPIC_BASE_URL") != "https://gateway.example"
+
+
 def test_gateway_deleted_shared_settings_remain_managed(share_setup):
     from tests.test_gateway_accounts import KEY
 
