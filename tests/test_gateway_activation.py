@@ -20,6 +20,27 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_gateway_json_status_keeps_kind_with_captured_metadata(self, gateway_switcher, temp_home, monkeypatch):
+        from claude_swap.transfer import export_accounts, import_accounts
+        from claude_swap.usage_store import UsageEntry
+
+        s = gateway_switcher
+        seed_oauth(s)
+        path = temp_home / "status-kind-replacement.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="gateway", credentials=KEY, baseUrl="https://replacement.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        def race(*args, **kwargs):
+            import_accounts(s, str(path), force=True)
+            return UsageEntry()
+        monkeypatch.setattr(s, "_active_account_usage", race)
+        result = s.status(json_output=True)
+        assert s.account_kind_for("1") == "gateway"
+        assert result["active"]["email"] == s.account_email("1")
+        assert "gateway" not in result["active"]
+        assert result["active"].get("kind") != "gateway"
+
     @pytest.mark.parametrize("json_output", [False, True])
     def test_gateway_status_rechecks_active_slot_before_live_capture(self, gateway_switcher, monkeypatch, capsys, json_output):
         from claude_swap import oauth

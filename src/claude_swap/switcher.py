@@ -6406,7 +6406,7 @@ class ClaudeAccountSwitcher:
             "usageStatus": status,
             "usage": usage,
         }
-        if self._account_kind(account_num) == "gateway":
+        if acct.get("kind") == "gateway":
             active.update(
                 kind="gateway",
                 usageStatus="gateway",
