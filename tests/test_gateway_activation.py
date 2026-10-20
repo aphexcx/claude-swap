@@ -717,7 +717,10 @@ class TestGatewayActivation:
         )
 
 
-def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_switcher):
+@pytest.mark.parametrize("ownership", ["known-foreign", "unresolved"])
+def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(
+    gateway_switcher, monkeypatch, ownership
+):
     from claude_swap import oauth
 
     s = gateway_switcher
@@ -733,14 +736,21 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(gateway_
         "accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": 1000,
     }})
     get_credentials_path().write_text(foreign)
-    s._probe_verdicts[s._lineage_key("1", email, oauth.credential_fingerprint(foreign))] = False
+    s._probe_verdicts.clear()
+    profile_calls = []
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: profile_calls.append(True))
+    if ownership == "known-foreign":
+        s._probe_verdicts[s._lineage_key("1", email, oauth.credential_fingerprint(foreign))] = False
     s.switch_to("1", json_output=True)
+    assert profile_calls
     assert s.read_account_credentials("1", email) == backup
     assert json.loads(get_credentials_path().read_text()) == original
     stash = s.list_unclaimed_credentials()
     assert len(stash) == 1
     entry_id, metadata = next(iter(stash.items()))
-    assert metadata["reason"] == "known-foreign"
+    assert metadata["reason"] == (
+        "known-foreign" if ownership == "known-foreign" else "gateway-retained-live"
+    )
     assert s._store._read_unclaimed_credential(entry_id) == (foreign, False)
 
 
