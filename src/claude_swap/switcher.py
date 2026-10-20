@@ -7665,10 +7665,13 @@ class ClaudeAccountSwitcher:
             },
         )
         if reason == "gateway-retained-live":
+            # Changed since the gateway entry, never reconciled by a forced
+            # entry, or superseded by an explicit replacement: ownership
+            # unproven either way, so say what was done, not who wrote it.
             self._logger.warning(
-                "Live login retained during the gateway episode was not written "
-                "into Account-%s, whose stored credential replaces it: stashed "
-                "as %s (credentials mtime %s).",
+                "The live login was not written into Account-%s, whose stored "
+                "credential replaces it on the gateway return: stashed as %s "
+                "(credentials mtime %s).",
                 current_account,
                 entry_id,
                 creds_mtime or "unknown",
@@ -7754,6 +7757,7 @@ class ClaudeAccountSwitcher:
 
     @staticmethod
     def _clear_gateway_replacement_flags(data: dict) -> None:
+        """Drop gateway-episode state at each entry and each OAuth activation."""
         for record in data.get("accounts", {}).values():
             record.pop("gatewayExplicitReplacement", None)
         data.pop("gatewayRetainedLiveFp", None)

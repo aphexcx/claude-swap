@@ -754,48 +754,71 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(
     assert s._store._read_unclaimed_credential(entry_id) == (foreign, False)
 
 
-@pytest.mark.parametrize("forced_entry", [False, True])
+def _oauth_blob(access, refresh, expires_at):
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": access, "refreshToken": refresh, "expiresAt": expires_at,
+    }})
+
+
+@pytest.mark.parametrize("entry", [
+    "own-bytes", "own-family", "own-rotated", "unresolved", "forced", "alien",
+])
 def test_gateway_return_stashes_only_live_login_changed_since_entry(
-    gateway_switcher, monkeypatch, caplog, forced_entry
+    gateway_switcher, monkeypatch, caplog, entry
 ):
     from claude_swap import oauth
 
     s = gateway_switcher
     seed_oauth(s)
     email = s.account_email("1")
-    own = json.dumps({"claudeAiOauth": {
-        "accessToken": "own-access", "refreshToken": "own-refresh", "expiresAt": 1000,
-    }})
-    s._write_account_credentials("1", email, own)
-    get_credentials_path().write_text(own)
-    # The retained login's access token has expired: the profile endpoint
-    # cannot attribute it at the return.
+    row = s._get_sequence_data()["accounts"]["1"]
+    s._write_account_credentials("1", email, _oauth_blob("own-access", "own-refresh", 1000))
+    live = {
+        "own-bytes": _oauth_blob("own-access", "own-refresh", 1000),
+        "own-family": _oauth_blob("live-access", "own-refresh", 1500),
+        "forced": _oauth_blob("own-access", "own-refresh", 1000),
+    }.get(entry, _oauth_blob("rotated-access", "rotated-refresh", 1500))
+    get_credentials_path().write_text(live)
+    profile = {
+        "own-rotated": {
+            "email": row["email"], "organizationUuid": row.get("organizationUuid") or "",
+            "uuid": "uuid-1",
+        },
+        "alien": {
+            "email": "alien@example.com", "organizationUuid": "org-alien", "uuid": "uuid-alien",
+        },
+    }.get(entry)
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: profile)
+    if entry == "forced":
+        # A fingerprint left by an episode that ended without an OAuth
+        # activation must not vouch for a forced entry that ran no backup.
+        data = s._get_sequence_data()
+        data["gatewayRetainedLiveFp"] = oauth.credential_fingerprint(live)
+        s._write_json(s.sequence_file, data)
+    s.switch_to("2", force=entry == "forced", json_output=True)
+    recorded = entry not in ("forced", "alien")
+    assert (
+        s._get_sequence_data().get("gatewayRetainedLiveFp")
+        == (oauth.credential_fingerprint(live) if recorded else None)
+    )
+    # The episode: polling rotates the slot, and the retained access token
+    # expires, so the profile endpoint cannot attribute it at the return.
+    polled = _oauth_blob("polled-access", "polled-refresh", 9000)
+    s._write_account_credentials("1", email, polled)
     monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: None)
-    for episode in (1, 2):
-        live = get_credentials_path().read_text()
-        s.switch_to("2", force=forced_entry, json_output=True)
-        polled = json.loads(live)
-        polled["claudeAiOauth"].update(
-            accessToken=f"polled-access-{episode}",
-            refreshToken=f"polled-refresh-{episode}",
-            expiresAt=1000 + episode,
-        )
-        s._write_account_credentials("1", email, json.dumps(polled))
-        caplog.clear()
-        s.switch_to("1", json_output=True)
-        assert json.loads(s.read_account_credentials("1", email)) == polled
-        assert json.loads(get_credentials_path().read_text()) == polled
-        stash = s.list_unclaimed_credentials()
-        if forced_entry:
-            # A forced entry never established the live login as the slot's.
-            assert len(stash) == episode
-            assert {m["reason"] for m in stash.values()} == {"gateway-retained-live"}
-            assert "outside cswap" not in caplog.text
-        else:
-            # Unchanged since the entry backup reconciled it with the slot:
-            # the slot's own predecessor, nothing to preserve or warn about.
-            assert stash == {}
-            assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    caplog.clear()
+    s.switch_to("1", json_output=True)
+    assert s.read_account_credentials("1", email) == polled
+    assert get_credentials_path().read_text() == polled
+    reasons = sorted(m["reason"] for m in s.list_unclaimed_credentials().values())
+    if recorded:
+        # Unchanged since the entry backup put its lineage in the slot: the
+        # slot's own predecessor, nothing to preserve or warn about.
+        assert reasons == []
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    else:
+        assert reasons == (["alien"] if entry == "alien" else []) + ["gateway-retained-live"]
+        assert "outside cswap" not in caplog.text
     data = s._get_sequence_data()
     assert "gatewayRetainedLiveFp" not in data
     assert not any("gatewayRetainedLiveFp" in record for record in data["accounts"].values())
