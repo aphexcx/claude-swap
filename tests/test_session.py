@@ -3386,6 +3386,34 @@ def test_gateway_generated_settings_adopt_later_shared_source(manager, temp_home
     assert not (profile / SHARE_MANIFEST).exists()
 
 
+@pytest.mark.parametrize("share", [False, True])
+def test_fresh_gateway_session_mirrors_default_mcp_servers(
+    manager, temp_home, capture_exec, share,
+):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    (temp_home / ".claude.json").write_text(
+        json.dumps({"theme": "light", "mcpServers": {"github": GITHUB_MCP}})
+    )
+    with pytest.raises(_ExecCalled) as exc:
+        manager.run("7", [], share=share)
+    profile = Path(exc.value.env["CLAUDE_CONFIG_DIR"])
+    config = _session_config(profile)
+    # The first launch, not a later one: the mirror needs a config to splice.
+    assert config.get("mcpServers") == ({"github": GITHUB_MCP} if share else None)
+    assert (profile / MCP_MIRROR_MARKER).exists() == share
+    assert config["hasCompletedOnboarding"] is True
+    assert config["theme"] == "light"
+    assert "oauthAccount" not in config
+    assert KEY not in (profile / ".claude.json").read_text()
+    profile_config = {**config, "projects": {"/w": {"allowedTools": []}}}
+    (profile / ".claude.json").write_text(json.dumps(profile_config))
+    with pytest.raises(_ExecCalled):
+        manager.run("7", [], share=share)
+    assert _session_config(profile) == profile_config
+
+
 @pytest.mark.parametrize("initial_share", [False, True])
 def test_gateway_settings_resume_sharing_after_no_share(manager, temp_home, initial_share):
     from tests.test_gateway_accounts import KEY
