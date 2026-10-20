@@ -315,6 +315,18 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 
 
 
+class _AccountInfo(tuple):
+    """Seven-field compatibility tuple with the credential's local auth snapshot."""
+
+    def __new__(cls, values, record):
+        result = super().__new__(cls, values)
+        result.authentication = (
+            record.get("kind", "oauth"), record.get("email"),
+            record.get("organizationUuid") or "", record.get("authGeneration"),
+        )
+        return result
+
+
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
@@ -3013,7 +3025,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if self._account_kind(str(num)) == "gateway" or looks_like_api_key(creds):
+        if self._account_info_kind(account_info) == "gateway" or looks_like_api_key(creds):
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -4634,7 +4646,11 @@ class ClaudeAccountSwitcher:
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
         """
-        data = self._get_sequence_data_migrated() or {}
+        with FileLock(self.lock_file):
+            return self._build_accounts_info_locked()
+
+    def _build_accounts_info_locked(self):
+        data = self._get_sequence_data_migrated(locked=True) or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -4663,11 +4679,25 @@ class ClaudeAccountSwitcher:
             else:
                 creds = self._read_account_credentials(str(num), email)
 
-            accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
+            accounts_info.append(_AccountInfo((num, email, org_name, org_uuid, is_active, creds, alias), account))
         return accounts_info
 
+    def _account_info_kind(self, info) -> str:
+        return info.authentication[0] if isinstance(info, _AccountInfo) else self._account_kind(str(info[0]))
+
+    def _account_info_current(self, info) -> bool:
+        if not isinstance(info, _AccountInfo):
+            return True
+        num = str(info[0])
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(num, {})
+        return not self._account_write_pending(num) and info.authentication == (
+            record.get("kind", "oauth"), record.get("email"),
+            record.get("organizationUuid") or "", record.get("authGeneration"),
+        )
+
     def _fetch_active_usage(
-        self, account_num: str, email: str, creds: str, org_uuid: str = ""
+        self, account_num: str, email: str, creds: str, org_uuid: str = "",
+        *, expected_generation=None,
     ) -> FetchRecord:
         """Usage fetch for the active/default account, refreshing an expired
         token under Claude Code's own lock protocol.
@@ -4706,7 +4736,10 @@ class ClaudeAccountSwitcher:
           the token endpoint rejects its reuse (verified: invalid_grant on
           re-presentation, siblings unaffected).
         """
-        expected_generation = self._oauth_write_generation(account_num, email, org_uuid)
+        current_generation = self._oauth_write_generation(account_num, email, org_uuid)
+        if expected_generation is not None and current_generation != expected_generation:
+            return FetchRecord(error="account-changed")
+        expected_generation = current_generation
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
@@ -5381,8 +5414,10 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
-        if self._account_kind(str(num)) == "gateway":
+        if self._account_info_kind(account_info) == "gateway":
             return "gateway"
+        if not self._account_info_current(account_info):
+            return USAGE_NO_CREDENTIALS
         if looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
@@ -5421,12 +5456,17 @@ class ClaudeAccountSwitcher:
         """One network fetch for one account. Never raises. ``rejected_fp``
         is the row's refused-credential stamp, if any."""
         num, email, _, org_uuid, is_active, creds, _alias = account_info
+        if self._account_info_kind(account_info) == "gateway":
+            return FetchRecord(sentinel="gateway")
+        if not self._account_info_current(account_info):
+            return FetchRecord(error="account-changed")
 
         # The active/default account owns the live credential — route it
         # through the locked-refresh path (refreshes an expired token under
         # Claude Code's own lock protocol, owner or not).
         if is_active:
-            return self._fetch_active_usage(str(num), email, creds, org_uuid)
+            auth_args = {"expected_generation": account_info.authentication[1:]} if isinstance(account_info, _AccountInfo) else {}
+            return self._fetch_active_usage(str(num), email, creds, org_uuid, **auth_args)
 
         from claude_swap.session import (
             read_session_credentials,
@@ -5685,6 +5725,7 @@ class ClaudeAccountSwitcher:
             records = self._run_usage_fetches(
                 [info_by_num[num] for num in claims], pre
             )
+            records = {num: record for num, record in records.items() if self._account_info_current(info_by_num[num])}
             plans = self._plans_after_fetch(records, pre, info_by_num)
             accepted = store.record(records, identities, claims, plans)
             accepted_records = {
@@ -6030,9 +6071,10 @@ class ClaudeAccountSwitcher:
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
-        for num, email, _org_name, org_uuid, _is_active, creds, _alias in accounts_info:
+        for info in accounts_info:
+            num, email, _org_name, org_uuid, _is_active, creds, _alias = info
             snum = str(num)
-            if data.get("accounts", {}).get(snum, {}).get("kind") == "gateway":
+            if self._account_info_kind(info) == "gateway":
                 continue
             fp = oauth.credential_fingerprint(creds) if creds else None
             if fp:
@@ -6125,7 +6167,8 @@ class ClaudeAccountSwitcher:
         accounts = []
         seq_data = self._get_sequence_data() or {}
         now = self._usage_store.clock()
-        for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
+        for info in accounts_info:
+            num, email, org_name, org_uuid, is_active, creds, alias = info
             if is_active:
                 active_num = num
             entry = entries[str(num)]
@@ -6152,7 +6195,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     policy=self._policy_from_data(seq_data, str(num)),
                     login_expires_at=(
-                        None if seq_data.get("accounts", {}).get(str(num), {}).get("kind") == "gateway"
+                        None if self._account_info_kind(info) == "gateway"
                         else oauth.login_expires_at_iso(creds)
                     ),
                     gateway_info=(

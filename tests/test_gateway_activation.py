@@ -20,6 +20,34 @@ def seed_oauth(s):
 
 
 class TestGatewayActivation:
+    def test_gateway_usage_routing_keeps_captured_active_generation(self, gateway_switcher, temp_home, monkeypatch):
+        from claude_swap import oauth
+        from claude_swap.transfer import export_accounts, import_accounts
+
+        s = gateway_switcher
+        seed_oauth(s)
+        email = s.account_email("1")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "live-access", "refreshToken": "live-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials("1", email, old)
+        get_credentials_path().write_text(old)
+        info = next(i for i in s._build_accounts_info() if i[0] == 1)
+        path = temp_home / "active-routing-replacement.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0]["credentials"] = {"claudeAiOauth": {"accessToken": "replacement-access", "refreshToken": "replacement-refresh", "expiresAt": 1000}}
+        path.write_text(json.dumps(envelope))
+        requests = []
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", lambda *args, **kwargs: requests.append(True) or oauth.UsageOutcome({"five_hour": {"pct": 10}}))
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda *args: {"uuid": "self-uuid", "email": email, "organizationUuid": ""})
+        fetch = s._fetch_active_usage
+        def race(*args, **kwargs):
+            import_accounts(s, str(path), force=True)
+            return fetch(*args, **kwargs)
+        monkeypatch.setattr(s, "_fetch_active_usage", race)
+        s._fetch_account_usage(info)
+        assert requests == []
+        assert json.loads(s._read_account_credentials("1", email))["claudeAiOauth"]["refreshToken"] == "replacement-refresh"
+
     @pytest.mark.parametrize("operation", ["adopt", "consume"])
     def test_gateway_rejects_stale_oauth_persistence_entry(self, gateway_switcher, monkeypatch, operation):
         from claude_swap import oauth

@@ -62,6 +62,60 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("mode", ["collector", "worker", "diagnostics", "after-static"])
+    def test_gateway_captured_credentials_never_cross_oauth_routing(self, gateway_switcher, temp_home, monkeypatch, mode):
+        from claude_swap import oauth
+        from claude_swap.usage_store import UsageEntry
+
+        s = gateway_switcher
+        key = json.dumps({"claudeAiOauth": {"accessToken": "opaque-access", "refreshToken": "opaque-refresh", "expiresAt": 9999999999999, "refreshTokenExpiresAt": 9999999999999}})
+        for num in (1, 2):
+            s.add_account_from_token(key, slot=num, base_url="https://gateway.example")
+        infos = s._build_accounts_info()
+        path = temp_home / "routing-replacement.json"
+        export_accounts(s, str(path))
+        envelope = json.loads(path.read_text())
+        for num, row in enumerate(envelope["accounts"]):
+            row.update(kind="oauth", credentials={"claudeAiOauth": {"accessToken": "oauth-access-" + str(num), "refreshToken": "oauth-refresh-" + str(num), "expiresAt": 9999999999999}})
+        path.write_text(json.dumps(envelope))
+        import_accounts(s, str(path), force=True)
+        requests = []
+        def fetch(*args, **kwargs):
+            requests.append(args[2])
+            return oauth.UsageOutcome({"five_hour": {"pct": 10}})
+        monkeypatch.setattr(oauth, "try_fetch_usage_for_account", fetch)
+        def unexpected(*args, **kwargs):
+            pytest.fail("Captured gateway credential reached an OAuth oracle")
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", unexpected)
+        monkeypatch.setattr(oauth, "fetch_oauth_profile", unexpected)
+        if mode == "after-static":
+            infos = s._build_accounts_info()
+            sentinel = s._static_usage_sentinel
+            replaced = []
+            def race(info):
+                result = sentinel(info)
+                if not replaced:
+                    replaced.append(True)
+                    for row in envelope["accounts"]:
+                        row.update(kind="gateway", credentials=key)
+                    path.write_text(json.dumps(envelope))
+                    import_accounts(s, str(path), force=True)
+                return result
+            monkeypatch.setattr(s, "_static_usage_sentinel", race)
+            s._collect_usage_entries(infos)
+        elif mode == "collector":
+            s._collect_usage_entries(infos)
+        elif mode == "worker":
+            for info in infos:
+                s._fetch_account_usage(info)
+        else:
+            assert all(s._token_status_lines(info) == [] for info in infos)
+            assert s._duplicate_account_warnings(infos) == []
+            payload = s._build_list_payload(infos, {"1": UsageEntry(), "2": UsageEntry()})
+            assert all("loginExpiresAt" not in row for row in payload["accounts"])
+        assert requests == []
+        assert all("lastGood" not in row for row in s._usage_store._read_rows().values())
+
     @pytest.mark.parametrize("phase", ["before-claim", "during-probe"])
     def test_gateway_probe_cannot_republish_after_oauth_replacement(self, gateway_switcher, temp_home, monkeypatch, phase):
         from claude_swap.autoswitch import due_candidate
