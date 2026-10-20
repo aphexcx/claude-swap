@@ -62,6 +62,36 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("active", [False, True])
+    def test_gateway_import_discards_oauth_polling_deadline(self, gateway_switcher, temp_home, monkeypatch, active):
+        from unittest.mock import Mock
+        from claude_swap.usage_store import FetchRecord
+
+        s = gateway_switcher
+        s.add_account_from_token("sk-ant-oat01-dummy", slot=1)
+        email = s.account_email("1")
+        monkeypatch.setattr(s._usage_store, "clock", lambda: 1000.0)
+        s._usage_store.record({"1": FetchRecord(usage={"five_hour": {"pct": 10}})}, {"1": (email, "")})
+        rows = s._usage_store._read_rows()
+        rows["1"].update(nextPollAt=2800.0, pollIntervalS=1800.0, heldUntil=2800.0)
+        s._usage_store._write_rows(rows)
+        path = temp_home / "gateway-over-oauth.json"
+        export_accounts(s, str(path), account="1")
+        envelope = json.loads(path.read_text())
+        envelope["accounts"][0].update(kind="gateway", credentials=KEY, baseUrl="https://gateway.example", auth="bearer", probeModel=gateway.DEFAULT_MODEL)
+        path.write_text(json.dumps(envelope))
+        import_accounts(s, str(path), force=True)
+        if active:
+            s.switch_to("1", json_output=True)
+        probe = Mock(return_value=dict(probeStatus="ok", probedAt=1000.0, retryAt=None, budget=None))
+        monkeypatch.setattr(gateway, "probe", probe)
+        entry = s._collect_usage_entries(s._build_accounts_info())["1"]
+        assert probe.call_count == 1
+        assert entry.gateway["probeStatus"] == "ok"
+        assert entry.last_good is None
+        assert entry.held_until is None
+        assert entry.next_poll_at == 1000.0 + (gateway.ACTIVE_INTERVAL_S if active else gateway.CANDIDATE_INTERVAL_S)
+
     @pytest.mark.parametrize("status", ["unauthorized", "transient", "cooling"])
     def test_gateway_probe_publishes_failure_during_credential_read_outage(self, gateway_switcher, monkeypatch, status):
         s = gateway_switcher
