@@ -754,6 +754,53 @@ def test_gateway_return_stashes_earlier_expiry_foreign_live_credentials(
     assert s._store._read_unclaimed_credential(entry_id) == (foreign, False)
 
 
+@pytest.mark.parametrize("forced_entry", [False, True])
+def test_gateway_return_stashes_only_live_login_changed_since_entry(
+    gateway_switcher, monkeypatch, caplog, forced_entry
+):
+    from claude_swap import oauth
+
+    s = gateway_switcher
+    seed_oauth(s)
+    email = s.account_email("1")
+    own = json.dumps({"claudeAiOauth": {
+        "accessToken": "own-access", "refreshToken": "own-refresh", "expiresAt": 1000,
+    }})
+    s._write_account_credentials("1", email, own)
+    get_credentials_path().write_text(own)
+    # The retained login's access token has expired: the profile endpoint
+    # cannot attribute it at the return.
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: None)
+    for episode in (1, 2):
+        live = get_credentials_path().read_text()
+        s.switch_to("2", force=forced_entry, json_output=True)
+        polled = json.loads(live)
+        polled["claudeAiOauth"].update(
+            accessToken=f"polled-access-{episode}",
+            refreshToken=f"polled-refresh-{episode}",
+            expiresAt=1000 + episode,
+        )
+        s._write_account_credentials("1", email, json.dumps(polled))
+        caplog.clear()
+        s.switch_to("1", json_output=True)
+        assert json.loads(s.read_account_credentials("1", email)) == polled
+        assert json.loads(get_credentials_path().read_text()) == polled
+        stash = s.list_unclaimed_credentials()
+        if forced_entry:
+            # A forced entry never established the live login as the slot's.
+            assert len(stash) == episode
+            assert {m["reason"] for m in stash.values()} == {"gateway-retained-live"}
+            assert "outside cswap" not in caplog.text
+        else:
+            # Unchanged since the entry backup reconciled it with the slot:
+            # the slot's own predecessor, nothing to preserve or warn about.
+            assert stash == {}
+            assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    data = s._get_sequence_data()
+    assert "gatewayRetainedLiveFp" not in data
+    assert not any("gatewayRetainedLiveFp" in record for record in data["accounts"].values())
+
+
 @pytest.mark.parametrize("missing", [False, True])
 def test_gateway_entry_can_recover_without_live_oauth_credentials(gateway_switcher, missing):
     s = gateway_switcher
