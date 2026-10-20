@@ -1908,8 +1908,8 @@ class ClaudeAccountSwitcher:
         """Public wrapper: account number → decision-grade usage value.
 
         Each value is a usage dict (last-good, trusted while ≤
-        ``usage_store.STALE_OK_S`` old), a sentinel string, or ``None``
-        (unknown).
+        ``usage_store.STALE_OK_S`` old), a gateway verdict under ``gateway``,
+        a sentinel string, or ``None`` (unknown).
         """
         return self._usage_by_account()
 
@@ -6028,7 +6028,11 @@ class ClaudeAccountSwitcher:
         """Map account number → decision-grade usage value for managed accounts."""
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info)
-        return {num: entry.decision_value() for num, entry in entries.items()}
+        return {
+            num: {"gateway": entry.gateway or {}}
+            if entry.sentinel == "gateway" else entry.decision_value()
+            for num, entry in entries.items()
+        }
 
     def _warn_inert_models(
         self,
@@ -6936,7 +6940,17 @@ class ClaudeAccountSwitcher:
                     )
                 continue
             if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate), models)
+                value = usage.get(candidate)
+                verdict = value.get("gateway", {}) if isinstance(value, dict) else {}
+                status = verdict.get("probeStatus")
+                if status in ("exhausted", "unauthorized"):
+                    skipped_exhausted.append(candidate)
+                    if json_output:
+                        warnings.append(f"Skipped Account-{candidate} (gateway {status})")
+                    else:
+                        print(f"{accent('Skipping')} Account-{candidate} (gateway {status})")
+                    continue
+                headroom = oauth.account_headroom(value, models)
                 if headroom is not None and headroom <= 0:
                     skipped_exhausted.append(candidate)
                     label = "5h/7d"

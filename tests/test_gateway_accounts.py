@@ -8,6 +8,7 @@ import pytest
 
 from claude_swap import cli, gateway
 from claude_swap.exceptions import ValidationError
+from claude_swap.gateway import probe as real_gateway_probe
 from claude_swap.models import Platform
 from claude_swap.settings import load_settings, set_setting
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -62,6 +63,36 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("json_output", [False, True])
+    @pytest.mark.parametrize("status", [429, 401, 200])
+    def test_next_available_preserves_gateway_probe_status(
+        self, gateway_switcher, monkeypatch, capsys, status, json_output
+    ):
+        from claude_swap.usage_store import FetchRecord
+        from tests.test_gateway_probe import respond
+
+        s = gateway_switcher
+        s.add_account_from_token("sk-ant-oat01-first", slot=1)
+        s.switch_to("1", json_output=True)
+        s.add_account_from_token(KEY, base_url="https://gateway.example", slot=2)
+        s.add_account_from_token("sk-ant-oat01-third", slot=3)
+        monkeypatch.setattr(gateway, "probe", real_gateway_probe)
+        request = respond(monkeypatch, status)
+        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre: {
+            str(info[0]): FetchRecord(usage={"five_hour": {"pct": 10}})
+            for info in infos
+        })
+        # Exercise collection and conversion too: a stubbed usage map misses
+        # the sentinel conversion that used to discard the actual HTTP verdict.
+        result = s.switch(strategy="next-available", json_output=json_output)
+        assert request.open.call_count == 1
+        assert s.current_account_number() == ("2" if status == 200 else "3")
+        output = capsys.readouterr().out
+        if status != 200:
+            reason = "exhausted" if status == 429 else "unauthorized"
+            message = f"Account-2 (gateway {reason})"
+            assert message in (" ".join(result["warnings"]) if json_output else output)
+
     @pytest.mark.parametrize("view", ["json-list", "dashboard"])
     def test_gateway_rendering_uses_one_metadata_snapshot(self, gateway_switcher, temp_home, monkeypatch, view):
         from claude_swap import oauth
