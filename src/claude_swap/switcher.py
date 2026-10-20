@@ -2633,6 +2633,7 @@ class ClaudeAccountSwitcher:
             self._logger.warning(note, account_num)
 
         outcome_creds = result.credentials
+        outcome_identity = result.token_account
         try:
             try:
                 with FileLock(self.lock_file):
@@ -2684,6 +2685,9 @@ class ClaudeAccountSwitcher:
                             "newer store credential.",
                         )
                         outcome_creds = store_now
+                        # The endpoint identity belongs to the stashed
+                        # successor, not the racing credential we adopted.
+                        outcome_identity = None
                     else:
                         self._write_account_credentials(
                             account_num, email, result.credentials
@@ -2750,14 +2754,14 @@ class ClaudeAccountSwitcher:
             # candidate (network?)" on every multi-surface race — the exact
             # contention this gate was built for, turned into a false alarm.
             return oauth.RefreshOutcome(
-                outcome_creds, "transient", result.token_account, consumed_fp,
+                outcome_creds, "transient", outcome_identity, consumed_fp,
                 # `consume-gate-unpersisted` is set precisely WHEN the stash
                 # write raised, so it is the one demoting reason that did not
                 # park anything. Every other one wrote the entry first.
                 stashed=stashed_reason != "consume-gate-unpersisted",
             )
         return oauth.RefreshOutcome(
-            outcome_creds, None, result.token_account, consumed_fp
+            outcome_creds, None, outcome_identity, consumed_fp
         )
 
     def _retire_stash_entry(self, entry_id: str, account_num: str) -> None:

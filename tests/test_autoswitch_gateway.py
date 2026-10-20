@@ -35,6 +35,33 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    def test_gateway_return_keeps_identity_paired_with_refresh_cas_winner(self, temp_home, monkeypatch):
+        import json
+        from claude_swap import oauth
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        s.switch_to("3", json_output=True)
+        email = s.account_email("2")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000}})
+        healthy = json.dumps({"claudeAiOauth": {"accessToken": "healthy-access", "refreshToken": "healthy-refresh", "expiresAt": 9999999999999}})
+        foreign = json.dumps({"claudeAiOauth": {"accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials("2", email, old)
+        generation = s._get_sequence_data()["accounts"]["2"].get("authGeneration")
+        identity = s.account_identity("2")
+        def refresh(*args, **kwargs):
+            s._write_account_credentials("2", email, healthy)
+            return oauth.RefreshOutcome(foreign, None, {"uuid": "foreign-uuid", "organizationUuid": "foreign-org"})
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        assert h.tick_with_entries(readings(h, second=10, status="exhausted")) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert "2" not in h.state().get("quarantine", {})
+        assert s._get_sequence_data()["accounts"]["2"].get("authGeneration") == generation
+        assert s.account_identity("2") == identity
+        assert s._read_account_credentials("2", email) == healthy
+        assert any(s._store._read_unclaimed_credential(i) == (foreign, False) for i in s.list_unclaimed_credentials())
+
     @pytest.mark.parametrize("failure", ["invalid_grant", "identity-conflict"])
     @pytest.mark.parametrize("phase", ["freshening", "state-lock"])
     def test_gateway_return_does_not_quarantine_a_racing_healthy_oauth_generation(self, temp_home, monkeypatch, failure, phase):
