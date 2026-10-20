@@ -6891,6 +6891,7 @@ class ClaudeAccountSwitcher:
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False,
         *, expected_source: str | None = None, expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> dict | None:
         """Switch to specific account.
 
@@ -7002,6 +7003,7 @@ class ClaudeAccountSwitcher:
             provenance=provenance,
             expected_source=expected_source,
             expected_target=expected_target,
+            expected_source_auth=expected_source_auth,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
@@ -7684,10 +7686,12 @@ class ClaudeAccountSwitcher:
             return self._read_account_credentials(slot, accounts[slot]["email"]) or None
 
     @contextmanager
-    def _check_expected_switch_source(self, expected_source: str | None, target: str, expected_target: dict | None):
+    def _check_expected_switch_source(self, expected_source: str | None, target: str, expected_target: dict | None, expected_source_auth: dict | None):
         """Caller holds all switch locks; check before settings mutation."""
         if expected_source is not None and self.current_account_number() != expected_source:
             raise StaleSwitchError("Active account changed; automatic switch discarded")
+        if expected_source_auth is not None and self._switch_target_snapshot(self._get_sequence_data() or {}, expected_source) != expected_source_auth:
+            raise StaleSwitchError("Source authentication changed; automatic switch discarded")
         if expected_target is not None and self._switch_target_snapshot(self._get_sequence_data() or {}, target) != expected_target:
             raise StaleSwitchError("Target account changed; automatic switch discarded")
         yield
@@ -7700,6 +7704,7 @@ class ClaudeAccountSwitcher:
         provenance: dict | None = None,
         expected_source: str | None = None,
         expected_target: dict | None = None,
+        expected_source_auth: dict | None = None,
     ) -> dict:
         """Perform the actual account switch with transaction support.
 
@@ -7821,7 +7826,7 @@ class ClaudeAccountSwitcher:
             FileLock(self.lock_file),
             claude_credentials_lock(),
             claude_config_lock(),
-            self._check_expected_switch_source(expected_source, target_account, expected_target),
+            self._check_expected_switch_source(expected_source, target_account, expected_target, expected_source_auth),
             self._gateway_settings_transaction(
                 target_account, provenance=provenance,
                 emit_output=emit_output, warnings_out=warnings_out,
