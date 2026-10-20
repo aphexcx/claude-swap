@@ -185,6 +185,7 @@ _DEMOTING_STASH_REASONS = (
     "consume-gate-persist-lock-failed",
     "consume-gate-unpersisted",
     "consume-gate-store-unreadable",
+    "consume-gate-account-replaced",
 )
 
 ERROR_NOTES = {
@@ -2421,6 +2422,9 @@ class ClaudeAccountSwitcher:
 
         try:
             with FileLock(self.lock_file):
+                expected_generation = self._oauth_write_generation(account_num, email)
+                if expected_generation is None:
+                    return oauth.RefreshOutcome(None, "transient")
                 current, unreadable = self._read_account_credentials_ex(
                     account_num, email
                 )
@@ -2623,7 +2627,13 @@ class ClaudeAccountSwitcher:
                     store_now, store_unreadable = (
                         self._read_account_credentials_ex(account_num, email)
                     )
-                    if store_unreadable:
+                    generation_changed = self._oauth_write_generation(account_num, email) != expected_generation
+                    if generation_changed and account_num in (self._get_sequence_data() or {}).get("accounts", {}):
+                        stash_successor(
+                            "consume-gate-account-replaced",
+                            "Account %s was replaced during a refresh POST; successor stashed, nothing rewritten.",
+                        )
+                    elif store_unreadable:
                         # The Keychain locked during the POST (macOS screen
                         # lock is ~1s away at any moment). The CAS cannot be
                         # evaluated: writing back could clobber a racing
@@ -3189,7 +3199,10 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
+        expected_generation = self._oauth_write_generation(account_num, email, org_uuid)
         with FileLock(self.lock_file):
+            if expected_generation is None or self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                return None
             if not profile_is_quiescent(session_dir):
                 return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
@@ -4568,6 +4581,19 @@ class ClaudeAccountSwitcher:
             key = self._read_account_credentials(number, email) if record.get("kind") == "gateway" else ""
             return dict(record), key or ""
 
+    def _oauth_write_generation(self, number: str, email: str, org_uuid: str | None = None):
+        """Local snapshot; persistence callers recheck while holding the roster lock."""
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(number, {})
+        org = record.get("organizationUuid") or ""
+        if (
+            not record or self._account_write_pending(number)
+            or record.get("kind", "oauth") != "oauth"
+            or record.get("email") != email
+            or (org_uuid is not None and org != org_uuid)
+        ):
+            return None
+        return email, org, record.get("authGeneration")
+
     def _switch_target_snapshot(self, data: dict, number: str) -> dict | None:
         record = data.get("accounts", {}).get(number)
         if record is None or self._account_write_pending(number):
@@ -4680,6 +4706,7 @@ class ClaudeAccountSwitcher:
           the token endpoint rejects its reuse (verified: invalid_grant on
           re-presentation, siblings unaffected).
         """
+        expected_generation = self._oauth_write_generation(account_num, email, org_uuid)
         oauth_data = oauth.extract_oauth_data(creds)
         if not oauth_data or not oauth_data.get("accessToken"):
             return FetchRecord(sentinel=USAGE_NO_CREDENTIALS)
@@ -4727,7 +4754,8 @@ class ClaudeAccountSwitcher:
                     # fine; writing waits for a non-degraded pass.
                     if not self._active_read_degraded:
                         self._resync_rotated_backup(
-                            account_num, email, org_uuid, creds
+                            account_num, email, org_uuid, creds,
+                            expected_generation=expected_generation,
                         )
                     if self._probe_verdicts and self._probe_verdicts.get(
                         self._lineage_key(
@@ -4850,6 +4878,8 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                if expected_generation is None or self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                    return _defer(force_refresh)
                 live = self._read_credentials()
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
@@ -5200,7 +5230,8 @@ class ClaudeAccountSwitcher:
         )
 
     def _resync_rotated_backup(
-        self, account_num: str, email: str, org_uuid: str, creds: str
+        self, account_num: str, email: str, org_uuid: str, creds: str,
+        *, expected_generation=None,
     ) -> None:
         """Resync the slot backup after a rotation that completed elsewhere.
 
@@ -5230,6 +5261,8 @@ class ClaudeAccountSwitcher:
         recovery branch consumes nothing it cannot attribute. Never raises.
         """
         try:
+            if expected_generation is None:
+                return
             creds_oauth = oauth.extract_oauth_data(creds)
             if not (
                 creds_oauth
@@ -5296,6 +5329,8 @@ class ClaudeAccountSwitcher:
             ):
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
+                if self._oauth_write_generation(account_num, email, org_uuid) != expected_generation:
+                    return
                 if not self._live_identity_matches(email, org_uuid):
                     return
                 # Verdict re-check under the lock: slot mutations hold this
