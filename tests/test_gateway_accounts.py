@@ -62,6 +62,30 @@ def gateway_switcher(temp_home, monkeypatch):
 
 
 class TestGatewayAccounts:
+    @pytest.mark.parametrize("status", ["unauthorized", "transient", "cooling"])
+    def test_gateway_probe_publishes_failure_during_credential_read_outage(self, gateway_switcher, monkeypatch, status):
+        s = gateway_switcher
+        s.add_account_from_token(KEY, slot=1, base_url="https://gateway.example")
+        now, unavailable, probes = [1000.0], [False], []
+        monkeypatch.setattr(s._usage_store, "clock", lambda: now[0])
+        read = s._read_account_credentials
+        monkeypatch.setattr(s, "_read_account_credentials", lambda *args: "" if unavailable[0] else read(*args))
+        def probe(*args, **kwargs):
+            probes.append(True)
+            unavailable[0] = True
+            since = (kwargs.get("previous") or {}).get("failureSince", kwargs["now"])
+            return dict(probeStatus=status, probedAt=kwargs["now"], failureSince=since, transientSince=since, retryAt=kwargs["now"] + 60 if status == "cooling" else None, budget=None)
+        monkeypatch.setattr(gateway, "probe", probe)
+        for _ in range(3):
+            unavailable[0] = False
+            entry = s._collect_usage_entries(s._build_accounts_info())["1"]
+            assert entry.gateway is not None
+            assert entry.gateway["probeStatus"] == status
+            assert entry.gateway["failureSince"] == 1000
+            now[0] += 601
+        if status == "unauthorized":
+            assert len(probes) == 1
+
     @pytest.mark.parametrize("mode", ["collector", "worker", "diagnostics", "after-static"])
     def test_gateway_captured_credentials_never_cross_oauth_routing(self, gateway_switcher, temp_home, monkeypatch, mode):
         from claude_swap import oauth

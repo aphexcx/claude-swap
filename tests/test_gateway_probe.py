@@ -34,6 +34,33 @@ def respond(monkeypatch, status, message="", retry=None):
 
 
 class TestGatewayProbe:
+    @pytest.mark.parametrize("cached", [None, 42, "bad"])
+    def test_gateway_rebuilds_non_object_cache_rows(self, temp_home, monkeypatch, cached):
+        store = UsageStore(temp_home / "cache", clock=lambda: 1000.0)
+        store._write_rows({"1": cached})
+        respond(monkeypatch, 200)
+        entry = store.collect_gateway("1", ("gw@example.com", ""), gateway.account_fields("https://gateway.example"), KEY, active=True, fetch=True)
+        assert entry.gateway["probeStatus"] == "ok"
+
+    def test_gateway_legacy_unavailable_fingerprint_keeps_failure_clock(self, temp_home, monkeypatch):
+        import hashlib
+
+        now = [1000.0]
+        store = UsageStore(temp_home / "cache", clock=lambda: now[0])
+        record = gateway.account_fields("https://gateway.example")
+        store.collect_gateway("1", ("gw@example.com", ""), record, "", active=True, fetch=True)
+        rows = store._read_rows()
+        row = rows["1"]
+        row.pop("gatewayAuthGeneration", None)
+        row.pop("gatewayConfigFingerprint", None)
+        config = {name: record.get(name) for name in ("baseUrl", "auth", "probeModel", "usageUrl")}
+        row["gatewayFingerprint"] = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        store._write_rows(rows)
+        now[0] += 601
+        respond(monkeypatch, 500)
+        entry = store.collect_gateway("1", ("gw@example.com", ""), record, KEY, active=True, fetch=True)
+        assert entry.gateway["failureSince"] == 1000
+
     @pytest.mark.parametrize("status", [401, 500, 503])
     def test_gateway_read_failures_preserve_failure_generation(self, temp_home, monkeypatch, status):
         now = [1000.0]
