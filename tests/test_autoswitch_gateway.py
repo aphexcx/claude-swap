@@ -35,6 +35,55 @@ def readings(h, first=100, second=100, status="ok", **extra):
 
 
 class TestAutoswitchGateway:
+    @pytest.mark.parametrize("failure", ["invalid_grant", "identity-conflict"])
+    @pytest.mark.parametrize("phase", ["freshening", "state-lock"])
+    def test_gateway_return_does_not_quarantine_a_racing_healthy_oauth_generation(self, temp_home, monkeypatch, failure, phase):
+        import json
+        from claude_swap import oauth
+
+        h = fleet(temp_home, monkeypatch)
+        s = h.switcher
+        s.switch_to("3", json_output=True)
+        email = s.account_email("2")
+        old = json.dumps({"claudeAiOauth": {"accessToken": "old-access", "refreshToken": "old-refresh", "expiresAt": 1000}})
+        healthy = json.dumps({"claudeAiOauth": {"accessToken": "healthy-access", "refreshToken": "healthy-refresh", "expiresAt": 9999999999999}})
+        foreign = json.dumps({"claudeAiOauth": {"accessToken": "foreign-access", "refreshToken": "foreign-refresh", "expiresAt": 9999999999999}})
+        s._write_account_credentials("2", email, old)
+        generation = s._get_sequence_data()["accounts"]["2"].get("authGeneration")
+        armed, replaced = [], []
+        def replace_token():
+            if not replaced:
+                replaced.append(True)
+                s._write_account_credentials("2", email, healthy)
+        def refresh(*args, **kwargs):
+            if failure == "invalid_grant":
+                armed.append(True)
+                if phase == "freshening":
+                    replace_token()
+                return oauth.RefreshOutcome(None, "invalid_grant")
+            return oauth.RefreshOutcome(foreign, None, {"uuid": "foreign"})
+        def note(*args):
+            armed.append(True)
+            if phase == "freshening":
+                replace_token()
+            return True
+        monkeypatch.setattr(oauth, "try_refresh_oauth_credentials", refresh)
+        monkeypatch.setattr(h.engine, "_freshen_target", AutoSwitchEngine._freshen_target.__get__(h.engine))
+        monkeypatch.setattr(h.engine, "_note_token_identity", note)
+        state_lock = h.engine._state_lock
+        def race():
+            if phase == "state-lock" and armed:
+                replace_token()
+            return state_lock()
+        monkeypatch.setattr(h.engine, "_state_lock", race)
+        entries = readings(h, second=10, status="exhausted")
+        h.tick_with_entries(entries)
+        assert s._get_sequence_data()["accounts"]["2"].get("authGeneration") == generation
+        assert s._read_account_credentials("2", email) == healthy
+        assert "2" not in h.state().get("quarantine", {})
+        assert h.tick_with_entries(entries) == TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
     @pytest.mark.parametrize("origin", ["oauth", "gateway"])
     @pytest.mark.parametrize("phase", ["post", "state-lock"])
     def test_gateway_replacement_is_not_quarantined_by_failed_oauth_refresh(self, temp_home, monkeypatch, origin, phase):
