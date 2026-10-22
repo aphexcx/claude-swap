@@ -1187,6 +1187,10 @@ class SessionManager:
             return
         managed = path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
         if not merge_shared:
+            if managed:
+                # Discard our copy before parsing; only surviving local
+                # settings need sanitizing when sharing is disabled.
+                self._remove_managed(path)
             source = path
         elif managed and (source is None or source == path):
             default = Path.home() / ".claude" / "settings.json"
