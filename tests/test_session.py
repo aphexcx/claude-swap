@@ -3447,3 +3447,183 @@ def test_gateway_session_scrubs_settings_auth_overrides(manager, temp_home, auth
     assert KEY not in (profile / "settings.json").read_text()
     if shared:
         assert source.read_text() == contents
+
+
+@pytest.mark.parametrize("platform", [Platform.MACOS, Platform.LINUX, Platform.WINDOWS])
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_preserves_edits_across_launch_and_switch(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates,
+    platform, identifier,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    s = manager.switcher
+    s.platform = platform
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    original = {
+        "theme": "light", "shared": "original", "removed": True,
+        "permissions": {"allow": ["Read"], "deny": ["Write"]},
+        "env": {"SHARED": "original", "REMOVED": "original", "NESTED": {"a": 1}},
+    }
+    source.write_text(json.dumps(original))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    assert not path.is_symlink()
+    local = json.loads(path.read_text())
+    local.update(theme="dark", model="session-model", permissions={"allow": ["Bash"]})
+    local.pop("removed")
+    local["env"].update(LOCAL="session", NESTED={"local": True})
+    local["env"].pop("REMOVED")
+    path.write_text(json.dumps(local))
+    default = {
+        **original, "theme": "concurrent", "shared": "updated", "added": True,
+        "removed": "concurrent", "permissions": {"allow": ["Edit"], "extra": True},
+        "env": {"SHARED": "updated", "REMOVED": "concurrent", "ADDED": "new",
+                "NESTED": {"default": True}},
+    }
+    source.write_text(json.dumps(default))
+
+    def assert_merged():
+        settings = json.loads(path.read_text())
+        assert settings["theme"] == "dark"
+        assert settings["model"] == "session-model"
+        assert settings["shared"] == "updated"
+        assert settings["added"] is True
+        assert "removed" not in settings
+        assert settings["permissions"] == {"allow": ["Bash"]}
+        assert settings["env"]["LOCAL"] == "session"
+        assert settings["env"]["SHARED"] == "updated"
+        assert settings["env"]["ADDED"] == "new"
+        assert settings["env"]["NESTED"] == {"local": True}
+        assert "REMOVED" not in settings["env"]
+
+    # The no-source callers must merge too, before a later sharing pass.
+    manager._isolate_auth_settings(profile, gateway_session=identifier == "7")
+    assert_merged()
+    manager.setup_session(identifier, share=True)
+    assert_merged()
+    s.switch_to("7", json_output=True)
+    assert_merged()
+    s.switch_to("2", json_output=True)
+    manager.setup_session(identifier, share=True)
+    assert_merged()
+    assert json.loads(source.read_text())["theme"] == "concurrent"
+    snapshot = profile / ".cswap-settings-base.json"
+    assert json.loads(snapshot.read_text())["theme"] == "concurrent"
+    if sys.platform != "win32":
+        assert snapshot.stat().st_mode & 0o777 == 0o600
+    # A second shared-only update follows the advanced baseline.
+    default["shared"] = "next"
+    default["env"]["SHARED"] = "next"
+    source.write_text(json.dumps(default))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["shared"] == settings["env"]["SHARED"] == "next"
+    assert settings["theme"] == "dark"
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_adopts_legacy_copy(
+    manager, temp_home, auth_status_tracks_seed, refresh_rotates, identifier,
+):
+    from tests.test_gateway_accounts import KEY
+
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text(json.dumps({"theme": "default", "added": True,
+                                  "env": {"DEFAULT": "new", "BOTH": "default"}}))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    snapshot.unlink(missing_ok=True)  # A managed copy written by round 6.
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"theme": "legacy", "nullable": None,
+                                "env": {"BOTH": "legacy", "LOCAL": "kept"}}))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "legacy"
+    assert settings["added"] is True
+    assert "nullable" in settings and settings["nullable"] is None
+    assert settings["env"]["DEFAULT"] == "new"
+    assert settings["env"]["BOTH"] == "legacy"
+    assert settings["env"]["LOCAL"] == "kept"
+    assert json.loads(snapshot.read_text())["theme"] == "default"
+
+
+@pytest.mark.parametrize("auth", ["bearer", "x-api-key"])
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_managed_settings_merge_scrubs_auth_and_snapshot(
+    manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates, auth, identifier,
+):
+    from claude_swap import gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", auth=auth, slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    payload = {
+        "theme": "default", "apiKeyHelper": gateway.helper("7"),
+        "env": {**dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+                "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes"},
+    }
+    source.write_text(json.dumps(payload))
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    payload["theme"] = "local"
+    path.write_text(json.dumps(payload))
+    manager.setup_session(identifier, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "local"
+    assert "apiKeyHelper" not in settings
+    assert settings["env"]["KEEP"] == "yes"
+    assert "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY" not in settings["env"]
+    assert not any(key in settings["env"] for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+    assert settings["env"].get("ANTHROPIC_BASE_URL") == (
+        None if identifier == "7" else gateway.FIRST_PARTY_URL
+    )
+    snapshot = profile / ".cswap-settings-base.json"
+    assert KEY not in path.read_text() + snapshot.read_text()
+    base = json.loads(snapshot.read_text())
+    assert "apiKeyHelper" not in base
+    assert not any(key in base.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+    assert base["theme"] == "default"
+
+
+def test_gateway_managed_settings_merge_cleans_snapshot_with_copy(share_setup):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    manager._sync_sharing(profile, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    assert snapshot.exists()
+    (source / "settings.json").unlink()
+    manager._sync_sharing(profile, share=True)
+    assert not snapshot.exists()
+    (source / "settings.json").write_text('{"theme":"new"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads(snapshot.read_text())["theme"] == "new"
+    manager._sync_sharing(profile, share=False)
+    assert not snapshot.exists()
+    assert not (profile / SHARE_MANIFEST).exists()
+
+
+def test_windows_managed_settings_merge_without_gateway(share_setup):
+    source, profile, manager = share_setup
+    manager.switcher.platform = Platform.WINDOWS
+    default = source / "settings.json"
+    default.write_text('{"theme":"light","env":{"REMOVED":"old"}}')
+    manager._sync_sharing(profile, share=True)
+    path = profile / "settings.json"
+    path.write_text('{"theme":"dark"}')  # Removing env removes its old keys.
+    (profile / "CLAUDE.md").write_text("local memory")
+    default.write_text('{"theme":"concurrent","added":true,"env":{"REMOVED":"new","ADDED":"yes"}}')
+    (source / "CLAUDE.md").write_text("updated shared memory")
+    manager._sync_sharing(profile, share=True)
+    assert json.loads(path.read_text()) == {
+        "theme": "dark", "added": True, "env": {"ADDED": "yes"},
+    }
+    assert (profile / "CLAUDE.md").read_text() == "updated shared memory"
