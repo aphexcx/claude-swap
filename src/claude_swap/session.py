@@ -17,11 +17,14 @@ mismatch is a hard "logged out" failure instead of a harmless stale entry.
 
 Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 ``CLAUDE.md``, ``skills/``, ``commands/``, ``agents/``, and ``rules/`` follow
-them into the session profile — symlinks on macOS/Linux (Claude's settings writer
-detects symlinks and writes through to the target, so in-session ``/config``
-changes land in ``~/.claude``), copies re-synced on every launch on Windows.
-Gateway auth isolation also makes settings a copy. Managed settings copies
-merge local edits with later default changes; other shared copies are refreshed.
+them into the session profile — symlinks on macOS/Linux, copies re-synced on
+every launch on Windows. On macOS/Linux, in-session ``/config`` edits follow
+the ``settings.json`` symlink to ``~/.claude`` until gateway auth isolation
+makes it a managed copy.
+Once a gateway account has existed, a session's managed settings copy merges
+local edits with default changes at each launch. It stays a copy after the last
+gateway is removed, and in-session settings edits stay in the session.
+Other shared copies are refreshed.
 A manifest records what cswap created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
@@ -744,14 +747,14 @@ class SessionManager:
             self._init_gateway_config(session_dir)
             self._sync_sharing(session_dir, share, share_history, gateway_session=True)
             with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
-                self._isolate_auth_settings(session_dir, gateway_session=True)
+                self._isolate_auth_settings(session_dir, gateway_session=True, merge_shared=share)
             return session_dir, account_num, email
 
         if self._has_gateway_accounts():
             # Repair old shared profiles before even the local auth probe:
             # its result must describe this OAuth account, not the default.
             with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
-                self._isolate_auth_settings(session_dir)
+                self._isolate_auth_settings(session_dir, merge_shared=share)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1172,14 +1175,20 @@ class SessionManager:
 
     def _isolate_auth_settings(
         self, session_dir: Path, *, gateway_session: bool = False,
-        source: Path | None = None,
+        source: Path | None = None, merge_shared: bool = True,
     ) -> None:
-        """Isolate auth, merging managed copies; caller holds the roster lock."""
+        """Isolate auth under the roster lock; no-share sanitizes only the copy."""
         from claude_swap import gateway
 
         path = session_dir / "settings.json"
+        if not merge_shared and path.is_symlink():
+            # Disabling sharing must not follow a link into default settings.
+            path.unlink()
+            return
         managed = path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
-        if managed and (source is None or source == path):
+        if not merge_shared:
+            source = path
+        elif managed and (source is None or source == path):
             default = Path.home() / ".claude" / "settings.json"
             if default.exists():
                 source = default
@@ -1217,13 +1226,15 @@ class SessionManager:
 
         Other nested objects, including values below env, are replaced whole.
         An empty base adopts a legacy copy without treating absent keys as
-        deletions: every existing local key wins, new default keys flow in.
+        deletions: existing non-auth local keys win, new default keys flow in.
+        Auth keys always come from the current default, never from local edits
+        or baseline comparisons; any session auth normalization runs afterward.
         """
         missing = object()
 
-        def merge(old: dict, local: dict, shared: dict) -> dict:
+        def merge(old: dict, local: dict, shared: dict, excluded: set[str]) -> dict:
             result = shared.copy()
-            for key in old.keys() | local.keys():
+            for key in (old.keys() | local.keys()) - excluded:
                 if local.get(key, missing) != old.get(key, missing):
                     if key in local:
                         result[key] = local[key]
@@ -1231,8 +1242,12 @@ class SessionManager:
                         result.pop(key, None)
             return result
 
-        result = merge(base, ours, theirs)
-        env = merge(base.get("env", {}), ours.get("env", {}), theirs.get("env", {}))
+        # env is compared only per key below, with its auth keys excluded too.
+        result = merge(base, ours, theirs, {"apiKeyHelper", "env"})
+        env = merge(base.get("env", {}), ours.get("env", {}), theirs.get("env", {}), {
+            *AUTH_OVERRIDE_ENV_VARS, "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+        })
         if env:
             result["env"] = env
         else:
@@ -1276,6 +1291,8 @@ class SessionManager:
             )
         if path.is_symlink():
             path.unlink()
+        # These atomic writes are not a transaction: a crash between them can
+        # make this sync's non-auth default changes look local at the next sync.
         gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
         gateway.atomic_bytes(base_path, (json.dumps(snapshot, indent=2) + "\n").encode())
 
@@ -1354,6 +1371,10 @@ class SessionManager:
         manifest_path = session_dir / SHARE_MANIFEST
         managed = self._read_manifest(manifest_path)
         isolate_settings = gateway_session or self._has_gateway_accounts()
+        if not share and isolate_settings:
+            self._isolate_auth_settings(
+                session_dir, gateway_session=gateway_session, merge_shared=False,
+            )
 
         # A flag turned off since last launch: remove the links we created
         # for it (never plain files/dirs the user accumulated themselves).
