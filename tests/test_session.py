@@ -3694,3 +3694,148 @@ def test_gateway_managed_settings_merge_refuses_malformed_inputs(share_setup, mo
     with pytest.raises(SessionError, match=str(profile / broken)):
         manager._sync_sharing(profile, share=True)
     assert {name: (profile / name).read_bytes() for name in before} == before
+
+
+@pytest.mark.parametrize("platform,isolate,gateway_session", [
+    (Platform.WINDOWS, False, False),
+    *[(platform, True, gateway_session)
+      for platform in (Platform.MACOS, Platform.LINUX, Platform.WINDOWS)
+      for gateway_session in (False, True)],
+])
+@pytest.mark.parametrize("auth_key", [
+    "apiKeyHelper", *session_mod.AUTH_OVERRIDE_ENV_VARS,
+    "ANTHROPIC_BASE_URL", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
+])
+def test_gateway_managed_auth_follows_default_across_syncs(
+    share_setup, monkeypatch, platform, isolate, gateway_session, auth_key,
+):
+    from claude_swap import gateway
+
+    source, profile, manager = share_setup
+    manager.switcher.platform = platform
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: isolate)
+    default = source / "settings.json"
+    path = profile / "settings.json"
+
+    def payload(value, theme):
+        settings = {"theme": theme, "env": {"SHARED": theme}}
+        if value is not None:
+            target = settings if auth_key == "apiKeyHelper" else settings["env"]
+            target[auth_key] = value
+        return settings
+
+    def expected(value):
+        if not isolate:
+            return value
+        if auth_key in session_mod.AUTH_OVERRIDE_ENV_VARS:
+            return None
+        if gateway_session:
+            return None
+        if auth_key == "ANTHROPIC_BASE_URL" and value is None:
+            return gateway.FIRST_PARTY_URL
+        return value
+
+    values = ("https://proxy-a.example", "https://proxy-b.example") if (
+        auth_key == "ANTHROPIC_BASE_URL"
+    ) else ("helper-a", "helper-b") if auth_key == "apiKeyHelper" else ("value-a", "value-b")
+    default.write_text(json.dumps(payload(values[0], "original")))
+    manager._sync_sharing(profile, share=True, gateway_session=gateway_session)
+    local = json.loads(path.read_text())
+    local["theme"] = "local"
+    local["env"]["LOCAL"] = "kept"
+    path.write_text(json.dumps(local))
+
+    # An inherited value must rotate, then disappear at the next sync.
+    # A later explicit auth edit in the copy must also lose to the default.
+    for value in (values[1], None, values[0]):
+        if value == values[0]:
+            local = json.loads(path.read_text())
+            target = local if auth_key == "apiKeyHelper" else local.setdefault("env", {})
+            target[auth_key] = values[1]
+            path.write_text(json.dumps(local))
+        shared = payload(value, "updated")
+        default.write_text(json.dumps(shared))
+        manager._sync_sharing(profile, share=True, gateway_session=gateway_session)
+        settings = json.loads(path.read_text())
+        target = settings if auth_key == "apiKeyHelper" else settings.get("env", {})
+        assert target.get(auth_key) == expected(value)
+        assert settings["theme"] == "local"
+        assert settings["env"]["LOCAL"] == "kept"
+        assert settings["env"]["SHARED"] == "updated"
+        assert json.loads(default.read_text()) == shared
+        baseline = json.loads((profile / session_mod.SETTINGS_BASE).read_text())
+        assert "apiKeyHelper" not in baseline
+        assert not any(key in baseline.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_gateway_managed_auth_local_deletions_do_not_override_default(
+    share_setup, monkeypatch, legacy,
+):
+    source, profile, manager = share_setup
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    default = source / "settings.json"
+    shared = {"theme": "default", "apiKeyHelper": "helper-a", "env": {
+        "ANTHROPIC_BASE_URL": "https://proxy.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    }}
+    default.write_text(json.dumps(shared))
+    manager._sync_sharing(profile, share=True)
+    if legacy:
+        (profile / session_mod.SETTINGS_BASE).unlink()
+    (profile / "settings.json").write_text('{"theme":"local"}')
+    manager._sync_sharing(profile, share=True)
+    assert json.loads((profile / "settings.json").read_text()) == {**shared, "theme": "local"}
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+@pytest.mark.parametrize("share", [False, True])
+def test_gateway_no_share_ignores_malformed_default_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier, share,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"default"}')
+    (source.parent / "CLAUDE.md").write_text("shared memory")
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    path.write_text(json.dumps({"theme": "local", "apiKeyHelper": gateway.helper("7"), "env": {
+        **dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+        "ANTHROPIC_BASE_URL": "https://gateway.example",
+        "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    }}))
+    source.write_text("{broken")
+    before_remove = []
+    remove = SessionManager._remove_managed
+
+    def capture_remove(dest):
+        if dest == path:
+            before_remove.append(json.loads(path.read_text()))
+        remove(dest)
+
+    monkeypatch.setattr(SessionManager, "_remove_managed", staticmethod(capture_remove))
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, *([] if share else ["--no-share"])])
+    if share:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        assert path.exists()
+        assert before_remove == []
+    else:
+        with pytest.raises(_ExecCalled) as exc:
+            cli.main()
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert before_remove == [{"theme": "local", **({"env": {
+            "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL,
+        }} if identifier == "2" else {})}]
+        assert not path.exists()
+        assert not (profile / "CLAUDE.md").exists()
+        assert not (profile / session_mod.SETTINGS_BASE).exists()
+        assert not (profile / SHARE_MANIFEST).exists()
+    assert source.read_text() == "{broken"
