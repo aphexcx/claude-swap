@@ -3839,3 +3839,71 @@ def test_gateway_no_share_ignores_malformed_default_settings(
         assert not (profile / session_mod.SETTINGS_BASE).exists()
         assert not (profile / SHARE_MANIFEST).exists()
     assert source.read_text() == "{broken"
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+def test_gateway_no_share_removes_malformed_managed_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    source = temp_home / ".claude" / "settings.json"
+    source.write_text('{"theme":"default"}')
+    profile, _, _ = manager.setup_session(identifier, share=True)
+    path = profile / "settings.json"
+    assert not path.is_symlink()
+    assert "settings.json" in json.loads((profile / SHARE_MANIFEST).read_text())["items"]
+    assert (profile / session_mod.SETTINGS_BASE).exists()
+    path.write_text("{broken")
+
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, "--no-share"])
+    with pytest.raises(_ExecCalled) as exc:
+        cli.main()
+
+    assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+    assert not path.exists()
+    assert not (profile / session_mod.SETTINGS_BASE).exists()
+    assert not (profile / SHARE_MANIFEST).exists()
+    assert source.read_text() == '{"theme":"default"}'
+
+
+@pytest.mark.parametrize("identifier", ["2", "7"])
+@pytest.mark.parametrize("malformed", [False, True])
+def test_gateway_no_share_preserves_profile_local_settings(
+    manager, temp_home, monkeypatch, capture_exec, auth_status_tracks_seed,
+    refresh_rotates, identifier, malformed,
+):
+    from claude_swap import cli, gateway
+    from tests.test_gateway_accounts import KEY
+
+    monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+    manager.switcher.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
+    profile, _, _ = manager.setup_session(identifier, share=False)
+    path = profile / "settings.json"
+    path.write_text("{broken" if malformed else json.dumps({
+        "theme": "local", "apiKeyHelper": gateway.helper("7"), "env": {
+            **dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+            "ANTHROPIC_BASE_URL": "https://gateway.example",
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1", "KEEP": "yes",
+        },
+    }))
+    monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
+    monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, "--no-share"])
+    if malformed:
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        assert path.read_text() == "{broken"
+    else:
+        with pytest.raises(_ExecCalled) as exc:
+            cli.main()
+        assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert json.loads(path.read_text()) == {"theme": "local", "env": {
+            "KEEP": "yes",
+            **({"ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL} if identifier == "2" else {}),
+        }}
