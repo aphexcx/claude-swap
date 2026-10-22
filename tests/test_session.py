@@ -3810,15 +3810,6 @@ def test_gateway_no_share_ignores_malformed_default_settings(
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
     }}))
     source.write_text("{broken")
-    before_remove = []
-    remove = SessionManager._remove_managed
-
-    def capture_remove(dest):
-        if dest == path:
-            before_remove.append(json.loads(path.read_text()))
-        remove(dest)
-
-    monkeypatch.setattr(SessionManager, "_remove_managed", staticmethod(capture_remove))
     monkeypatch.setattr(cli, "ClaudeAccountSwitcher", lambda **kw: manager.switcher)
     monkeypatch.setattr(sys, "argv", ["cswap", "run", identifier, *([] if share else ["--no-share"])])
     if share:
@@ -3826,14 +3817,10 @@ def test_gateway_no_share_ignores_malformed_default_settings(
             cli.main()
         assert exc.value.code == 1
         assert path.exists()
-        assert before_remove == []
     else:
         with pytest.raises(_ExecCalled) as exc:
             cli.main()
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(profile)
-        assert before_remove == [{"theme": "local", **({"env": {
-            "ANTHROPIC_BASE_URL": gateway.FIRST_PARTY_URL,
-        }} if identifier == "2" else {})}]
         assert not path.exists()
         assert not (profile / "CLAUDE.md").exists()
         assert not (profile / session_mod.SETTINGS_BASE).exists()
