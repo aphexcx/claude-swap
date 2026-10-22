@@ -20,6 +20,8 @@ Sharing: by default the user's ``settings.json``, ``keybindings.json``,
 them into the session profile — symlinks on macOS/Linux (Claude's settings writer
 detects symlinks and writes through to the target, so in-session ``/config``
 changes land in ``~/.claude``), copies re-synced on every launch on Windows.
+Gateway auth isolation also makes settings a copy. Managed settings copies
+merge local edits with later default changes; other shared copies are refreshed.
 A manifest records what cswap created so removal never touches user data.
 
 History sharing (``--share-history``, opt-in): additionally links
@@ -44,6 +46,7 @@ import subprocess
 import sys
 import time
 import unicodedata
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -93,6 +96,9 @@ HISTORY_ITEMS = (
 # Records which entries in a session profile cswap created (so --no-share and
 # re-syncs only ever remove cswap-managed links/copies, never user data).
 SHARE_MANIFEST = ".cswap-shared.json"
+
+# Last shared settings, without credentials, for merging managed copies.
+SETTINGS_BASE = ".cswap-settings-base.json"
 
 # Deferred-invalidation marker: backup credentials changed while a session was
 # live (we never pull credentials out from under a running claude), so the
@@ -737,13 +743,15 @@ class SessionManager:
             _mkdir_private(session_dir)
             self._init_gateway_config(session_dir)
             self._sync_sharing(session_dir, share, share_history, gateway_session=True)
-            self._isolate_auth_settings(session_dir, gateway_session=True)
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._isolate_auth_settings(session_dir, gateway_session=True)
             return session_dir, account_num, email
 
         if self._has_gateway_accounts():
             # Repair old shared profiles before even the local auth probe:
             # its result must describe this OAuth account, not the default.
-            self._isolate_auth_settings(session_dir)
+            with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+                self._isolate_auth_settings(session_dir)
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
@@ -1166,21 +1174,117 @@ class SessionManager:
         self, session_dir: Path, *, gateway_session: bool = False,
         source: Path | None = None,
     ) -> None:
-        """Copy customizations without inheriting default-login gateway auth."""
+        """Isolate auth, merging managed copies; caller holds the roster lock."""
         from claude_swap import gateway
 
         path = session_dir / "settings.json"
+        managed = path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
+        if managed and (source is None or source == path):
+            default = Path.home() / ".claude" / "settings.json"
+            if default.exists():
+                source = default
         source = source or path
         if not source.exists():
             if path.is_symlink():
                 path.unlink()
             return
+        if source != path:
+            self._sync_settings_copy(path, source, gateway_session=gateway_session)
+            return
+        settings = self._read_settings(source)
+        if not self._normalize_auth_settings(
+            settings, source, gateway_session=gateway_session, managed=managed,
+        ):
+            return
+        if path.is_symlink():
+            path.unlink()
+        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+
+    @staticmethod
+    def _read_settings(path: Path) -> dict:
+        from claude_swap import gateway
+
         try:
-            settings = gateway.read_settings(source)
+            return gateway.read_settings(path)
         except ValueError:
             raise SessionError(
-                f"Cannot read Claude settings file {source}; repair it before retrying"
+                f"Cannot read Claude settings file {path}; repair it before retrying"
             ) from None
+
+    @staticmethod
+    def _merge_settings(base: dict, ours: dict, theirs: dict) -> dict:
+        """Apply local changes over the default, one level into env only.
+
+        Other nested objects, including values below env, are replaced whole.
+        An empty base adopts a legacy copy without treating absent keys as
+        deletions: every existing local key wins, new default keys flow in.
+        """
+        missing = object()
+
+        def merge(old: dict, local: dict, shared: dict) -> dict:
+            result = shared.copy()
+            for key in old.keys() | local.keys():
+                if local.get(key, missing) != old.get(key, missing):
+                    if key in local:
+                        result[key] = local[key]
+                    else:
+                        result.pop(key, None)
+            return result
+
+        result = merge(base, ours, theirs)
+        env = merge(base.get("env", {}), ours.get("env", {}), theirs.get("env", {}))
+        if env:
+            result["env"] = env
+        else:
+            result.pop("env", None)
+        return result
+
+    def _sync_settings_copy(
+        self, path: Path, source: Path, *, gateway_session: bool | None = None,
+    ) -> None:
+        """Merge a managed copy and advance its private, credential-free base.
+
+        None keeps non-isolated sharing's auth behavior. For isolated
+        copies, normalize the baseline like the output so generated auth
+        values are never mistaken for local edits. The caller holds the
+        roster lock across reading, merging and publishing both files.
+        """
+        from claude_swap import gateway
+
+        theirs = self._read_settings(source)
+        snapshot = deepcopy(theirs)
+        if gateway_session is not None:
+            self._normalize_auth_settings(
+                snapshot, source, gateway_session=gateway_session, managed=True,
+            )
+        # Foreign helpers can embed credentials too. Never persist a helper
+        # or a credential-bearing env override in the merge baseline.
+        snapshot.pop("apiKeyHelper", None)
+        for name in AUTH_OVERRIDE_ENV_VARS:
+            snapshot.get("env", {}).pop(name, None)
+        if not snapshot.get("env"):
+            snapshot.pop("env", None)
+        base_path = path.parent / SETTINGS_BASE
+        settings = theirs
+        if path.is_file() and not path.is_symlink():
+            settings = self._merge_settings(
+                self._read_settings(base_path), self._read_settings(path), theirs,
+            )
+        if gateway_session is not None:
+            self._normalize_auth_settings(
+                settings, path, gateway_session=gateway_session, managed=True,
+            )
+        if path.is_symlink():
+            path.unlink()
+        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+        gateway.atomic_bytes(base_path, (json.dumps(snapshot, indent=2) + "\n").encode())
+
+    def _normalize_auth_settings(
+        self, settings: dict, source: Path, *, gateway_session: bool, managed: bool,
+    ) -> bool:
+        """Apply the session auth rules in place; leave private customizations alone."""
+        from claude_swap import gateway
+
         owned_helper = gateway.owned_slot(settings.get("apiKeyHelper")) is not None
         gateway_urls = self._gateway_urls()
         base_url = settings.get("env", {}).get("ANTHROPIC_BASE_URL")
@@ -1189,9 +1293,8 @@ class SessionManager:
                 f"Cannot read Claude settings file {source}; ANTHROPIC_BASE_URL must be a string"
             )
         gateway_url = base_url in gateway_urls
-        managed = source != path or path.is_symlink() or "settings.json" in self._read_manifest(session_dir / SHARE_MANIFEST)
         if not gateway_session and not managed and not owned_helper and not gateway_url:
-            return  # A profile-local customization belongs to its user.
+            return False  # A profile-local customization belongs to its user.
         if gateway_session or owned_helper:
             settings.pop("apiKeyHelper", None)
         env = settings.setdefault("env", {})
@@ -1205,9 +1308,7 @@ class SessionManager:
             env["ANTHROPIC_BASE_URL"] = gateway.FIRST_PARTY_URL
         if not env:
             settings.pop("env", None)
-        if path.is_symlink():
-            path.unlink()
-        gateway.atomic_bytes(path, (json.dumps(settings, indent=2) + "\n").encode())
+        return True
 
     def _sync_sharing(
         self, session_dir: Path, share: bool, share_history: bool = False,
@@ -1276,7 +1377,13 @@ class SessionManager:
             src = source_root / name
             dest = session_dir / name
 
-            if name == "settings.json" and isolate_settings:
+            if name == "settings.json" and (
+                isolate_settings
+                or (name in managed and dest.is_file() and not dest.is_symlink())
+                or (not use_symlinks and (
+                    name in managed or not dest.exists() or dest.is_symlink()
+                ))
+            ):
                 if not src.exists():
                     if name in managed:
                         self._remove_managed(dest)
@@ -1293,9 +1400,12 @@ class SessionManager:
                 # Keep shared customizations as a copy. Linking would let a
                 # later default gateway switch change this session's auth.
                 source = src if name in managed or not dest.exists() or dest.is_symlink() else dest
-                self._isolate_auth_settings(
-                    session_dir, gateway_session=gateway_session, source=source
-                )
+                if isolate_settings:
+                    self._isolate_auth_settings(
+                        session_dir, gateway_session=gateway_session, source=source
+                    )
+                else:
+                    self._sync_settings_copy(dest, source)
                 if source == src and src.exists():
                     new_managed.append(name)
                 continue
@@ -1680,6 +1790,8 @@ class SessionManager:
         """Remove a cswap-created share entry (link or copy), never user data
         beyond it — callers guarantee `dest` is manifest-listed or a symlink."""
         try:
+            if dest.name == "settings.json":
+                (dest.parent / SETTINGS_BASE).unlink(missing_ok=True)
             if dest.is_symlink() or dest.is_file():
                 dest.unlink(missing_ok=True)
             elif dest.is_dir():

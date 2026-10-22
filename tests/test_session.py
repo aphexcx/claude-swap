@@ -933,7 +933,7 @@ class TestSharingWindowsMode:
 
         mgr._sync_sharing(session_dir, share=True)
 
-        assert (session_dir / "settings.json").read_text() == '{"changed": true}'
+        assert json.loads((session_dir / "settings.json").read_text()) == {"changed": True}
 
     def test_no_share_removes_copies(self, windows_mgr):
         source, session_dir, mgr = windows_mgr
@@ -3449,17 +3449,15 @@ def test_gateway_session_scrubs_settings_auth_overrides(manager, temp_home, auth
         assert source.read_text() == contents
 
 
-@pytest.mark.parametrize("platform", [Platform.MACOS, Platform.LINUX, Platform.WINDOWS])
 @pytest.mark.parametrize("identifier", ["2", "7"])
 def test_gateway_managed_settings_merge_preserves_edits_across_launch_and_switch(
     manager, temp_home, monkeypatch, auth_status_tracks_seed, refresh_rotates,
-    platform, identifier,
+    identifier,
 ):
     from claude_swap import gateway
     from tests.test_gateway_accounts import KEY
 
     s = manager.switcher
-    s.platform = platform
     monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
     s.add_account_from_token(KEY, base_url="https://gateway.example", slot=7)
     source = temp_home / ".claude" / "settings.json"
@@ -3627,3 +3625,72 @@ def test_windows_managed_settings_merge_without_gateway(share_setup):
         "theme": "dark", "added": True, "env": {"ADDED": "yes"},
     }
     assert (profile / "CLAUDE.md").read_text() == "updated shared memory"
+
+
+@pytest.mark.parametrize("platform", [Platform.MACOS, Platform.LINUX, Platform.WINDOWS])
+def test_gateway_managed_settings_merge_on_every_platform(share_setup, monkeypatch, platform):
+    source, profile, manager = share_setup
+    manager.switcher.platform = platform
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    default = source / "settings.json"
+    default.write_text('{"theme":"light","defaultOnly":true,"env":{"SHARED":"old","REMOVE":"old","DEFAULT_ONLY":"old"}}')
+    manager._sync_sharing(profile, share=True)
+    path = profile / "settings.json"
+    local = json.loads(path.read_text())
+    local["theme"] = "dark"
+    local["env"]["LOCAL"] = "kept"
+    local["env"].pop("REMOVE")
+    path.write_text(json.dumps(local))
+    default.write_text('{"theme":"concurrent","env":{"SHARED":"new","REMOVE":"new"}}')
+    manager._sync_sharing(profile, share=True)
+    settings = json.loads(path.read_text())
+    assert settings["theme"] == "dark"
+    assert settings["env"]["SHARED"] == "new"
+    assert settings["env"]["LOCAL"] == "kept"
+    assert "REMOVE" not in settings["env"]
+    assert "defaultOnly" not in settings
+    assert "DEFAULT_ONLY" not in settings["env"]
+    # Removing the last gateway must not turn the copy back into a symlink
+    # and discard the session's accumulated edits.
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: False)
+    manager._sync_sharing(profile, share=True)
+    assert not path.is_symlink()
+    assert json.loads(path.read_text())["theme"] == "dark"
+
+
+@pytest.mark.parametrize("isolate", [False, True])
+def test_gateway_managed_settings_merge_snapshot_omits_foreign_helper(
+    share_setup, monkeypatch, isolate,
+):
+    from tests.test_gateway_accounts import KEY
+
+    source, profile, manager = share_setup
+    manager.switcher.platform = Platform.WINDOWS
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: isolate)
+    default = source / "settings.json"
+    default.write_text(json.dumps({
+        "apiKeyHelper": "printf " + KEY, "theme": "kept",
+        "env": dict.fromkeys(session_mod.AUTH_OVERRIDE_ENV_VARS, KEY),
+    }))
+    manager._sync_sharing(profile, share=True)
+    snapshot = profile / ".cswap-settings-base.json"
+    assert KEY not in snapshot.read_text()
+    base = json.loads(snapshot.read_text())
+    assert base["theme"] == "kept"
+    assert "apiKeyHelper" not in base
+    assert not any(key in base.get("env", {}) for key in session_mod.AUTH_OVERRIDE_ENV_VARS)
+
+
+@pytest.mark.parametrize("broken", ["settings.json", ".cswap-settings-base.json"])
+def test_gateway_managed_settings_merge_refuses_malformed_inputs(share_setup, monkeypatch, broken):
+    source, profile, manager = share_setup
+    monkeypatch.setattr(manager, "_has_gateway_accounts", lambda: True)
+    manager._sync_sharing(profile, share=True)
+    (profile / broken).write_text("{broken")
+    before = {name: (profile / name).read_bytes() for name in (
+        "settings.json", ".cswap-settings-base.json",
+    )}
+    (source / "settings.json").write_text('{"theme":"new"}')
+    with pytest.raises(SessionError, match=str(profile / broken)):
+        manager._sync_sharing(profile, share=True)
+    assert {name: (profile / name).read_bytes() for name in before} == before
