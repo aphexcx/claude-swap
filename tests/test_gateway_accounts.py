@@ -78,7 +78,7 @@ class TestGatewayAccounts:
         s.add_account_from_token("sk-ant-oat01-third", slot=3)
         monkeypatch.setattr(gateway, "probe", real_gateway_probe)
         request = respond(monkeypatch, status)
-        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre: {
+        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre, *, profile_due=frozenset(): {
             str(info[0]): FetchRecord(usage={"five_hour": {"pct": 10}})
             for info in infos
         })
@@ -105,7 +105,7 @@ class TestGatewayAccounts:
         s.add_account_from_token(KEY, base_url="https://gateway.example", slot=2)
         monkeypatch.setattr(gateway, "probe", real_gateway_probe)
         respond(monkeypatch, 401)
-        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre: {})
+        monkeypatch.setattr(s, "_run_usage_fetches", lambda infos, pre, *, profile_due=frozenset(): {})
         result = s.switch(strategy="next-available", json_output=json_output)
         assert s.current_account_number() == "1"
         message = "All other accounts are at their limits or unavailable — staying on Account-1."
@@ -302,7 +302,7 @@ class TestGatewayAccounts:
         entries = s.usage_entries_by_account(fetch=set())
         assert due_candidate(["1"], entries, s._usage_store.clock()) == "1"
         polled = []
-        def fetch(infos, pre):
+        def fetch(infos, pre, *, profile_due=frozenset()):
             polled.extend(str(i[0]) for i in infos)
             return {str(i[0]): FetchRecord(usage={"five_hour": {"pct": 10}}) for i in infos}
         monkeypatch.setattr(s, "_run_usage_fetches", fetch)
@@ -347,7 +347,7 @@ class TestGatewayAccounts:
         usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 20.0}}
         polled = []
 
-        def fetch(infos, pre):
+        def fetch(infos, pre, *, profile_due=frozenset()):
             polled.extend(str(info[0]) for info in infos)
             return {str(info[0]): FetchRecord(usage=usage) for info in infos}
 

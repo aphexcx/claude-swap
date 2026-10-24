@@ -570,6 +570,15 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    # Same hermeticity for the plan-tier read (``fetch_oauth_plan_profile``),
+    # which the usage collector makes after a successful fetch and
+    # ``add_account`` makes after a capture. A stubbed "network" failure avoids
+    # live requests while exercising cached failures and usage-derived flags.
+    from claude_swap import oauth as _oauth
+    monkeypatch.setattr(
+        "claude_swap.oauth.fetch_oauth_plan_profile",
+        lambda token, timeout_s=5.0: _oauth.ProfileOutcome(None, error="network"),
+    )
     yield
 
 

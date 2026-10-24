@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from claude_swap import autoswitch
+from claude_swap import autoswitch, plan_tier
 from tests.test_autoswitch import EngineHarness, _entry_for, _usage
 
 
@@ -42,10 +42,20 @@ def test_gateway_fleet_default_identity(temp_home, monkeypatch, strategy):
         h.tick_with_entries(entries)
         with patch.object(h.switcher, "_collect_usage_entries", return_value=entries):
             rows = h.switcher.list_accounts(json_output=True)["accounts"]
+        # The tier port adds unknown metadata to OAuth rows. Verify the exact
+        # addition, then retain the original golden for all pre-existing data.
+        unknown_tier = plan_tier.tier_json_fields(None)
+        for row in rows:
+            assert {key: row.pop(key) for key in unknown_tier} == unknown_tier
         artifacts["sequence"].append(h.switcher.sequence_file.read_bytes())
         artifacts["settings"].append(settings.read_bytes())
         artifacts["rows"].append(json.dumps(rows).encode())
-    artifacts["events"].append(json.dumps([e.to_json() for e in h.events]).encode())
+    events = [e.to_json() for e in h.events]
+    for event in events:
+        if event["event"] == "poll":
+            assert event.pop("accountTiers") == {"1": unknown_tier, "2": unknown_tier}
+            assert {key: event["active"].pop(key) for key in unknown_tier} == unknown_tier
+    artifacts["events"].append(json.dumps(events).encode())
     digests = {
         name: hashlib.sha256(b"\n".join(parts)).hexdigest()
         for name, parts in artifacts.items()

@@ -34,7 +34,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
@@ -269,6 +269,14 @@ class FetchRecord:
     # persists: later passes skip the request while the credential still
     # carries that token, and a success clears it.
     rejected_fp: str | None = None
+    # --- in-memory only: neither is read by ``record`` nor written to the
+    # store. ``access_token`` is the token the usage endpoint just accepted
+    # (None on failure/sentinel), so the collector can make one follow-up
+    # plan-tier profile read with a token known to be live. ``profile`` is
+    # that read's outcome (``oauth.ProfileOutcome``) when the collector
+    # asked for one this pass.
+    access_token: str | None = field(default=None, repr=False)
+    profile: object | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
