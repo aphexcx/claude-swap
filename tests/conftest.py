@@ -572,8 +572,8 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
     # Same hermeticity for the plan-tier read (``fetch_oauth_plan_profile``),
     # which the usage collector makes after a successful fetch and
-    # ``add_account`` makes after a capture. A stubbed "network" failure keeps
-    # every pre-existing test's roster free of tier fields.
+    # ``add_account`` makes after a capture. A stubbed "network" failure avoids
+    # live requests while exercising cached failures and usage-derived flags.
     from claude_swap import oauth as _oauth
     monkeypatch.setattr(
         "claude_swap.oauth.fetch_oauth_plan_profile",

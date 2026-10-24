@@ -353,6 +353,7 @@ class _AccountInfo(tuple):
             key: record.get(key)
             for key in ("uuid", "email", "organizationUuid", "authGeneration")
         }
+        result.tier_eligible = record.get("planTierEligible")
         return result
 
 
@@ -1948,7 +1949,8 @@ class ClaudeAccountSwitcher:
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
-        for num, email, org_name, org_uuid, is_active, _creds, alias in accounts_info:
+        for info in accounts_info:
+            num, email, org_name, org_uuid, is_active, _creds, alias = info
             n = str(num)
             record = seq_data.get("accounts", {}).get(n, {})
             kind = record.get("kind", "oauth")
@@ -1972,7 +1974,7 @@ class ClaudeAccountSwitcher:
                         if kind == "gateway"
                         else None
                     ),
-                    **self._tier_snapshot_fields(seq_data, n, _creds),
+                    **self._tier_snapshot_fields(self._tier_record_for_info(info, record)),
                 )
             )
         return AccountsSnapshot(
@@ -1981,10 +1983,9 @@ class ClaudeAccountSwitcher:
             taken_at=self._usage_store.clock(),
         )
 
-    def _tier_snapshot_fields(self, seq_data: dict, account_num: str, creds: str | None = None) -> dict:
+    @staticmethod
+    def _tier_snapshot_fields(record: dict) -> dict:
         """``AccountSnapshot`` tier kwargs from an already-loaded roster."""
-        record = seq_data.get("accounts", {}).get(str(account_num))
-        record = self._tier_record_for(account_num, record, creds)
         if record.get("kind", "oauth") != "oauth":
             return {}
         tier = record.get("planTier")
@@ -4524,6 +4525,10 @@ class ClaudeAccountSwitcher:
                 }
                 if is_api_key:
                     record["kind"] = "api_key"
+                elif not gateway_fields:
+                    # Inference-only setup tokens have no subscription profile.
+                    # Renderers must know this without opening the Keychain.
+                    record["planTierEligible"] = False
                 record.update(gateway_fields)
                 if alias:
                     record["alias"] = alias
@@ -5786,6 +5791,7 @@ class ClaudeAccountSwitcher:
             for num, email, _org_name, org_uuid, _active, _creds, _alias in accounts_info
         }
         info_by_num = {str(info[0]): info for info in accounts_info}
+        self._persist_tier_capabilities(accounts_info)
         # Scoped-window models so the 429-stale trust bound honors per-model
         # (e.g. Fable) resets, matching the poll planner's window view.
         _threshold, _weekly_threshold, models = self._poll_policy_inputs()
@@ -5939,16 +5945,46 @@ class ClaudeAccountSwitcher:
         )
 
     def _tier_record_for(self, num: str, record: dict | None, creds: str | None = None) -> dict:
-        """Filter display metadata without changing a seat's stored kind."""
+        """Filter cached display metadata; never read a credential store."""
         if not isinstance(record, dict):
             return {}
         if record.get("kind", "oauth") != "oauth":
             return record
-        if creds is None:
-            creds = self._read_account_credentials(str(num), record.get("email", ""))
-        if not self._profile_capable_credential(creds):
+        if record.get("planTierEligible") is False or (
+            creds is not None and not self._profile_capable_credential(creds)
+        ):
             return {"kind": "setup_token"}
         return record
+
+    def _tier_record_for_info(self, info, record: dict) -> dict:
+        """Do not label a captured name with a replacement slot's tier."""
+        if isinstance(info, _AccountInfo) and (
+            not record
+            or info.authentication[0] != record.get("kind", "oauth")
+            or info.tier_identity.get("authGeneration") != record.get("authGeneration")
+            or plan_tier.identity_disagrees(info.tier_identity, record)
+        ):
+            return {"kind": "unavailable"}
+        return self._tier_record_for(str(info[0]), record, info[5])
+
+    def _persist_tier_capabilities(self, accounts_info) -> None:
+        """Migrate legacy token rows using credentials the collector already read.
+
+        Normal OAuth rows need no marker or write. An explicit OAuth replacement
+        clears a former inference-only marker on its next collection pass.
+        """
+        updates, identities = {}, {}
+        for info in accounts_info:
+            if self._account_info_kind(info) != "oauth" or not info[5]:
+                continue
+            eligible = self._profile_capable_credential(info[5])
+            previous = getattr(info, "tier_eligible", None)
+            if (previous is None and eligible) or previous == eligible:
+                continue
+            num = str(info[0])
+            updates[num] = {"planTierEligible": eligible}
+            identities[num] = getattr(info, "tier_identity", (info[1], info[3]))
+        self._persist_tier_fields(updates, identities)
 
     def _tier_due_slots(
         self,
@@ -6120,6 +6156,8 @@ class ClaudeAccountSwitcher:
             fields[plan_tier.PROFILE_IDENTITY_KEY] = plan_tier.profile_identity(outcome.data)
         else:
             fields = plan_tier.tier_error_fields(outcome.error or "unknown", now)
+        if record.get("planTierEligible") is False:
+            fields["planTierEligible"] = True
         self._persist_tier_fields(
             {str(account_num): fields},
             {str(account_num): expected},
@@ -6644,7 +6682,7 @@ class ClaudeAccountSwitcher:
                         else None
                     ),
                     tier=plan_tier.tier_json_fields(
-                        self._tier_record_for(str(num), record, creds)
+                        self._tier_record_for_info(info, record)
                     ),
                 )
             )
@@ -6713,7 +6751,8 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
+        for i, info in enumerate(accounts_info):
+            num, email, org_name, org_uuid, is_active, creds, alias = info
             record = seq_data.get("accounts", {}).get(str(num), {})
             tag = (
                 gateway.tag(record)
@@ -6723,7 +6762,7 @@ class ClaudeAccountSwitcher:
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             tier_text = plan_tier.tier_display(
-                self._tier_record_for(str(num), record, creds)
+                self._tier_record_for_info(info, record)
             )
             if tier_text:
                 markers += f" {muted(f'[{tier_text}]')}"

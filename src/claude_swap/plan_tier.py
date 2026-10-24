@@ -62,6 +62,7 @@ _COMPACT = {
 #: Sequence-record keys this module owns. Kept in one place so a persist
 #: that compares "did anything change?" and a JSON projection agree.
 RECORD_KEYS = (
+    "planTierEligible",
     "planTier",
     "rateLimitTier",
     "organizationType",
@@ -354,7 +355,10 @@ def tier_display(
     profiled (API-key slots have no tier to show). A 401 on the profile with
     no cached tier renders :data:`RELOGIN_TIER_TEXT`.
     """
-    if not isinstance(record, dict) or record.get("kind", "oauth") != "oauth":
+    if (
+        not isinstance(record, dict) or record.get("kind", "oauth") != "oauth"
+        or record.get("planTierEligible") is False
+    ):
         return None
     tier = record.get("planTier")
     access = record.get("fableAccess")
@@ -400,7 +404,7 @@ def tier_json_fields(record: dict | None) -> dict:
     """Additive ``--json`` keys for an account row. Always emitted (null when
     unknown) so scripts can key on them without probing for presence."""
     rec = record if isinstance(record, dict) else {}
-    if rec.get("kind", "oauth") != "oauth":
+    if rec.get("kind", "oauth") != "oauth" or rec.get("planTierEligible") is False:
         return {}
     tier = rec.get("planTier")
     fetched_at = rec.get("tierFetchedAt")

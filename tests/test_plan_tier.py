@@ -1025,6 +1025,12 @@ class TestForkTierContract:
         data["accounts"]["1"].update(planTier="Max 20x", fableAccess=True)
         data["accounts"]["2"].update(planTier="Team standard", fableAccess=False)
         harness.switcher._write_json(harness.switcher.sequence_file, data)
+        with patch.object(harness.switcher, "_read_account_credentials",
+                          side_effect=AssertionError("poll labels must not read the Keychain")):
+            assert harness.switcher.plan_tier_labels()["1"] == "Max 20x"
+            assert harness.switcher.plan_tier_fields()["2"]["fableWindow"] is False
+        # The engine's pre-existing account/health checks may read credentials;
+        # the two new metadata providers above must add no such reads.
         harness.tick_with_usage({"1": _usage(20), "2": _usage(30)})
         poll = next(event for event in harness.events if isinstance(event, PollEvent))
         payload = poll.to_json()
@@ -1065,3 +1071,56 @@ class TestForkTierContract:
     def test_accepted_token_and_raw_profile_are_not_in_reprs(self):
         assert "test-secret" not in repr(oauth.UsageOutcome(None, access_token="test-secret"))
         assert "test-secret" not in repr(FetchRecord(access_token="test-secret", profile={"data": "test-secret"}))
+
+    def test_legacy_token_capability_uses_already_collected_credentials(self, temp_home):
+        switcher = ClaudeAccountSwitcher()
+        switcher.add_account_from_token("sk-ant-oat01-test", email="custom@example.test", slot=1)
+        data = switcher._get_sequence_data()
+        del data["accounts"]["1"]["planTierEligible"]
+        data["accounts"]["1"].update(planTier="Pro", fableAccess=True)
+        switcher._write_json(switcher.sequence_file, data)
+        infos = switcher._build_accounts_info()
+        with patch.object(switcher, "_read_account_credentials",
+                          side_effect=AssertionError("capability migration must reuse captured credentials")):
+            switcher._collect_usage_entries(infos, fetch=set())
+            assert switcher.plan_tier_labels() == {}
+            assert switcher.plan_tier_fields() == {}
+        assert _record(switcher, "1")["planTierEligible"] is False
+
+        # Replacing the inference-only credential with a full OAuth login must
+        # make the same slot eligible again, without any explicit re-probe.
+        switcher._write_account_credentials("1", "custom@example.test", ACTIVE)
+        switcher._collect_usage_entries(switcher._build_accounts_info(), fetch=set())
+        assert _record(switcher, "1")["planTierEligible"] is True
+
+    @pytest.mark.parametrize("surface", ["list", "json", "snapshot"])
+    def test_swap_during_collection_does_not_attach_a_foreign_tier(
+        self, temp_home, mock_claude_config, sample_sequence_data, capsys, surface
+    ):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        sample_sequence_data["accounts"]["1"].update(planTier="Max 20x", fableAccess=True)
+        sample_sequence_data["accounts"]["2"].update(planTier="Team standard", fableAccess=False)
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+
+        def race(accounts_info, **kwargs):
+            data = switcher._get_sequence_data()
+            accounts = data["accounts"]
+            accounts["1"], accounts["2"] = accounts["2"], accounts["1"]
+            switcher._write_json(switcher.sequence_file, data)
+            return {str(info[0]): UsageEntry() for info in accounts_info}
+
+        with patch.object(switcher, "_collect_usage_entries", side_effect=race):
+            if surface == "snapshot":
+                rows = switcher.accounts_snapshot().accounts
+                assert rows[0].email == "test@example.com"
+                assert all(row.tier_label is None for row in rows)
+            elif surface == "json":
+                rows = switcher.list_accounts(json_output=True)["accounts"]
+                assert rows[0]["email"] == "test@example.com"
+                assert all("planTier" not in row and "fableWindow" not in row for row in rows)
+            else:
+                switcher.list_accounts()
+                output = capsys.readouterr().out
+                assert "test@example.com" in output
+                assert "Max 20x" not in output and "Team standard" not in output
