@@ -5956,13 +5956,20 @@ class ClaudeAccountSwitcher:
             return {"kind": "setup_token"}
         return record
 
+    @staticmethod
+    def _tier_identity_matches(identity: dict | None, record: dict) -> bool:
+        """Whether cached facts still belong to the captured seat generation."""
+        return bool(
+            identity and record
+            and identity.get("kind", "oauth") == record.get("kind", "oauth")
+            and identity.get("authGeneration") == record.get("authGeneration")
+            and not plan_tier.identity_disagrees(identity, record)
+        )
+
     def _tier_record_for_info(self, info, record: dict) -> dict:
         """Do not label a captured name with a replacement slot's tier."""
-        if isinstance(info, _AccountInfo) and (
-            not record
-            or info.authentication[0] != record.get("kind", "oauth")
-            or info.tier_identity.get("authGeneration") != record.get("authGeneration")
-            or plan_tier.identity_disagrees(info.tier_identity, record)
+        if isinstance(info, _AccountInfo) and not self._tier_identity_matches(
+            {**info.tier_identity, "kind": info.authentication[0]}, record
         ):
             return {"kind": "unavailable"}
         return self._tier_record_for(str(info[0]), record, info[5])
@@ -6214,7 +6221,19 @@ class ClaudeAccountSwitcher:
                 probed.add(n)
         return probed
 
-    def plan_tier_labels(self, *, compact: bool = True) -> dict[str, str]:
+    def plan_tier_identities(self) -> dict[str, dict]:
+        """Capture names and tier identities together without reading credentials."""
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): {key: record.get(key) for key in (
+                "uuid", "email", "organizationUuid", "authGeneration",
+            )} | {"kind": record.get("kind", "oauth")}
+            for num, record in data.get("accounts", {}).items()
+        }
+
+    def plan_tier_labels(
+        self, *, compact: bool = True, identities: dict[str, dict] | None = None,
+    ) -> dict[str, str]:
         """Slot → rendered tier label (``"Team std · no Fable"``) for every
         slot with a known tier — a pure file read for log lines and event
         payloads (the auto engine's tick summary)."""
@@ -6224,17 +6243,20 @@ class ClaudeAccountSwitcher:
             return {}
         out: dict[str, str] = {}
         for num, record in data.get("accounts", {}).items():
+            if identities is not None and not self._tier_identity_matches(identities.get(str(num)), record):
+                continue
             label = plan_tier.tier_display(self._tier_record_for(num, record), compact=compact)
             if label:
                 out[str(num)] = label
         return out
 
-    def plan_tier_fields(self) -> dict[str, dict]:
+    def plan_tier_fields(self, *, identities: dict[str, dict] | None = None) -> dict[str, dict]:
         """Structured per-seat facts for auto --json; no network reads."""
         data = self._get_sequence_data() or {}
         return {
             str(num): fields
             for num, record in data.get("accounts", {}).items()
+            if identities is None or self._tier_identity_matches(identities.get(str(num)), record)
             if (fields := plan_tier.tier_json_fields(self._tier_record_for(num, record)))
         }
 

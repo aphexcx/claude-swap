@@ -1047,8 +1047,11 @@ class TestForkTierContract:
                           side_effect=AssertionError("poll labels must not read the Keychain")):
             assert harness.switcher.plan_tier_labels()["1"] == "Max 20x"
             assert harness.switcher.plan_tier_fields()["2"]["fableWindow"] is False
+            identities = harness.switcher.plan_tier_identities()
+            assert harness.switcher.plan_tier_labels(identities=identities)["1"] == "Max 20x"
+            assert harness.switcher.plan_tier_fields(identities=identities)["2"]["fableWindow"] is False
         # The engine's pre-existing account/health checks may read credentials;
-        # the two new metadata providers above must add no such reads.
+        # the metadata providers above must add no such reads.
         harness.tick_with_usage({"1": _usage(20), "2": _usage(30)})
         poll = next(event for event in harness.events if isinstance(event, PollEvent))
         payload = poll.to_json()
@@ -1057,6 +1060,84 @@ class TestForkTierContract:
         assert payload["accountTiers"]["2"]["planTier"] == "Team standard"
         assert payload["accountTiers"]["2"]["fableWindow"] is False
         assert "Max 20x" in poll.human() and "Team std · no Fable" in poll.human()
+
+    @pytest.mark.parametrize("change", ["swap", "uuid", "organizationUuid", "authGeneration", "removed"])
+    @pytest.mark.parametrize("when", ["collection", "after_capture"])
+    def test_auto_poll_drops_tiers_when_captured_identity_changes(self, temp_home, change, when):
+        from tests.test_autoswitch import EngineHarness, _usage
+
+        harness = EngineHarness(temp_home)
+        for num, email in [(1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")]:
+            harness.seed(num, email)
+        harness.make_live("a@example.com", 1)
+        switcher = harness.switcher
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"].update(planTier="Max 20x", fableAccess=True)
+        data["accounts"]["2"].update(planTier="Team standard", fableAccess=False)
+        data["accounts"]["3"].update(planTier="Pro", fableAccess=True)
+        if change == "organizationUuid":
+            data["accounts"]["1"]["organizationUuid"] = "original-org"
+            config_path = temp_home / ".claude.json"
+            config = json.loads(config_path.read_text())
+            config["oauthAccount"]["organizationUuid"] = "original-org"
+            config_path.write_text(json.dumps(config))
+        switcher._write_json(switcher.sequence_file, data)
+
+        def race(*args, **kwargs):
+            data = switcher._get_sequence_data()
+            accounts = data["accounts"]
+            if change == "swap":
+                accounts["1"], accounts["2"] = accounts["2"], accounts["1"]
+            elif change == "removed":
+                del accounts["1"]
+            else:
+                accounts["1"][change] = "replacement"
+                accounts["1"].update(planTier="Team standard", fableAccess=False)
+            switcher._write_json(switcher.sequence_file, data)
+            return {}, {"1": _usage(20)}, {"1": 80.0}
+
+        if when == "collection":
+            with patch.object(harness.engine, "_collect_scheduled_usage", side_effect=race):
+                harness.engine.tick()
+        else:
+            capture = switcher.plan_tier_identities
+
+            def capture_then_race():
+                identities = capture()
+                race()
+                return identities
+
+            with patch.object(switcher, "plan_tier_identities", side_effect=capture_then_race), \
+                 patch.object(harness.engine, "_collect_scheduled_usage",
+                              return_value=({}, {"1": _usage(20)}, {"1": 80.0})):
+                harness.engine.tick()
+        poll = next(event for event in harness.events if isinstance(event, PollEvent))
+        payload = poll.to_json()
+        assert poll.active == {"number": 1, "email": "a@example.com"}
+        assert poll.headroom["1"] == 80.0
+        assert "a@example.com" in poll.human()
+        assert "1" not in poll.tiers and "1" not in payload["accountTiers"]
+        assert "planTier" not in payload["active"] and "fableWindow" not in payload["active"]
+        assert "Max 20x" not in poll.human() and "Team std" not in poll.human()
+        assert payload["accountTiers"]["3"]["planTier"] == "Pro"
+        if change == "swap":
+            assert "2" not in poll.tiers and "2" not in payload["accountTiers"]
+
+    def test_auto_poll_without_identity_snapshot_keeps_line_without_tiers(self, temp_home):
+        from tests.test_autoswitch import EngineHarness, _usage
+
+        harness = EngineHarness(temp_home)
+        harness.seed(1, "a@example.com")
+        harness.make_live("a@example.com", 1)
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["1"].update(planTier="Pro", fableAccess=True)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        with patch.object(harness.switcher, "plan_tier_identities", side_effect=OSError("unavailable")):
+            harness.tick_with_usage({"1": _usage(20)})
+        poll = next(event for event in harness.events if isinstance(event, PollEvent))
+        assert "a@example.com" in poll.human()
+        assert poll.tiers == {} and poll.account_tiers == {}
+        assert "planTier" not in poll.to_json()["active"]
 
     @pytest.mark.parametrize("change", ["uuid", "authGeneration", "kind"])
     def test_tier_persist_drops_replaced_identity_or_auth_generation(self, temp_home, sample_sequence_data, change):

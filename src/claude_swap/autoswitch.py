@@ -1219,8 +1219,13 @@ class AutoSwitchEngine:
                 )
             return TickOutcome.NO_ACTION
 
+        # Capture the poll's name and tier identity in one roster read. Usage
+        # collection may outlive a swap/move; later tier reads must match this
+        # identity and authGeneration before they can label the captured name.
+        tier_identities = self._plan_tier_identities()
         current_email = self.switcher.account_email(current)
-        active_ref = _ref(current, current_email) if current_email else {
+        poll_email = tier_identities.get(current, {}).get("email") or current_email
+        active_ref = _ref(current, poll_email) if poll_email else {
             "number": int(current),
             "email": "",
         }
@@ -1267,8 +1272,8 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
-                tiers=self._plan_tier_labels(),
-                account_tiers=self._plan_tier_fields(),
+                tiers=self._plan_tier_labels(tier_identities),
+                account_tiers=self._plan_tier_fields(tier_identities),
             )
         )
 
@@ -2587,23 +2592,32 @@ class AutoSwitchEngine:
 
     # -- adaptive usage scheduling ---------------------------------------------
 
-    def _plan_tier_labels(self) -> dict[str, str]:
+    def _plan_tier_identities(self) -> dict[str, dict]:
+        getter = getattr(self.switcher, "plan_tier_identities", None)
+        if getter is None:
+            return {}
+        try:
+            return dict(getter())
+        except Exception:  # a missing snapshot suppresses labels, not the tick
+            return {}
+
+    def _plan_tier_labels(self, identities: dict[str, dict]) -> dict[str, str]:
         """Compact tier labels for the tick line — a pure roster read, and
         optional: a switcher double without it (tests) simply yields none."""
         getter = getattr(self.switcher, "plan_tier_labels", None)
         if getter is None:
             return {}
         try:
-            return dict(getter())
+            return dict(getter(identities=identities))
         except Exception:  # never let a label lookup break a tick
             return {}
 
-    def _plan_tier_fields(self) -> dict[str, dict]:
+    def _plan_tier_fields(self, identities: dict[str, dict]) -> dict[str, dict]:
         getter = getattr(self.switcher, "plan_tier_fields", None)
         if getter is None:
             return {}
         try:
-            return dict(getter())
+            return dict(getter(identities=identities))
         except Exception:  # metadata must never interrupt switching
             return {}
 
