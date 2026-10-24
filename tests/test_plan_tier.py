@@ -214,8 +214,8 @@ class TestCacheRules:
         rec = {"planTier": "Pro", "fableAccess": False}
         assert not plan_tier.merge_record_fields(rec, {"planTier": "Pro", "fableAccess": False})
 
-    def test_401_without_cache_reads_as_relogin(self):
-        assert plan_tier.tier_display({"tierError": "http-401"}) == "tier: re-login needed"
+    def test_401_without_cache_reads_as_unread(self):
+        assert plan_tier.tier_display({"tierError": "http-401"}) == "tier: not read yet"
         # a cached tier wins over the 401 note
         assert plan_tier.tier_display({"planTier": "Pro", "tierError": "http-401"}) == "Pro"
 
@@ -488,7 +488,7 @@ class TestCollectorPersistsTier:
         assert rec["tierError"] == "network"
         assert "[Max 5x · Fable]" in capsys.readouterr().out
 
-    def test_401_without_cache_shows_relogin(
+    def test_401_without_cache_shows_unread_tier(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
@@ -500,7 +500,7 @@ class TestCollectorPersistsTier:
             oauth.ProfileOutcome(None, error="http-401"),
         )
         assert _record(switcher, "1")["tierError"] == "http-401"
-        assert "[tier: re-login needed]" in capsys.readouterr().out
+        assert "[tier: not read yet]" in capsys.readouterr().out
 
     def test_no_profile_read_without_an_accepted_token(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -705,12 +705,45 @@ class TestCollectorPersistsTier:
         assert not plan_tier.identity_disagrees({"uuid": "u-1", "email": "OLD@example.com"}, legacy)
         assert plan_tier.identity_disagrees({"uuid": "u-1", "email": "other@example.com"}, legacy)
 
+    def test_refresh_401_with_fresh_usage_shows_unread_tier(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A rejected backup token is not proof the seat needs a new login."""
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        self._run_list(
+            switcher,
+            oauth.UsageOutcome(USAGE_NO_FABLE, access_token="sk-accepted"),
+            oauth.ProfileOutcome(None, error="network"),
+        )
+        capsys.readouterr()
+        with patch.object(switcher, "_read_active_credentials",
+                          return_value=ActiveCredentials(ACTIVE, False)), \
+             patch.object(switcher, "_read_account_credentials", return_value=BACKUP), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account") as usage_mock, \
+             patch("claude_swap.oauth.fetch_oauth_plan_profile",
+                   return_value=oauth.ProfileOutcome(None, error="http-401")) as profile_mock:
+            switcher.list_accounts(refresh=True)
+            profile_mock.assert_any_call("sk-backup")
+            assert profile_mock.call_count == 2
+            usage_mock.assert_not_called()  # fresh usage means no claim/re-probe
+            assert "[tier: not read yet]" in capsys.readouterr().out
+            payload = switcher.list_accounts(json_output=True)
+            switcher.list_accounts()
+            assert profile_mock.call_count == 2
+            usage_mock.assert_not_called()
+        output = capsys.readouterr().out
+        assert "[tier: not read yet]" in output and "re-login needed" not in output
+        assert all(row["tierError"] == "http-401" and row["planTier"] is None
+                   for row in payload["accounts"])
+
     def test_refresh_retries_after_a_401_probe_once_the_token_recovers(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
         """Locally unexpired but server-rejected token: the direct probe 401s,
         the collect pass refreshes and re-probes with the accepted token, and
-        the healthy account does not sit on `tier: re-login needed`."""
+        the account shows its tier immediately."""
         sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
         switcher = ClaudeAccountSwitcher()
         _seed(switcher, sample_sequence_data)
@@ -869,9 +902,9 @@ class TestTuiRows:
         assert account_card_text(acc, 100).plain.count("[") == 1
         assert mini_account_text(acc, time.time()).plain.count("[") == 1
 
-    def test_relogin_note_on_card(self):
+    def test_unread_tier_note_on_card(self):
         acc = _snap("4", tier_error="http-401")
-        assert "[tier: re-login needed]" in account_card_text(acc, 100).plain
+        assert "[tier: not read yet]" in account_card_text(acc, 100).plain
 
 
 class TestMenuBar:

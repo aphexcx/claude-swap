@@ -74,9 +74,10 @@ RECORD_KEYS = (
     "fableAccess",
 )
 
-#: Shown in place of a tier when the profile endpoint answered 401 and no
-#: earlier tier is cached — the access token is dead, not the tier unknown.
-RELOGIN_TIER_TEXT = "tier: re-login needed"
+#: A profile 401 without an earlier cached tier proves only that the tier
+#: has not been read. An explicit probe may have used a superseded backup
+#: token; the usage/authentication path decides whether re-login is needed.
+UNREAD_TIER_TEXT = "tier: not read yet"
 
 
 @dataclass(frozen=True)
@@ -357,7 +358,7 @@ def tier_display(
     only as ``"no Fable"`` since presence is the norm there). None when
     nothing is known yet, so surfaces can omit the label for accounts never
     profiled (API-key slots have no tier to show). A 401 on the profile with
-    no cached tier renders :data:`RELOGIN_TIER_TEXT`.
+    no cached tier renders :data:`UNREAD_TIER_TEXT`.
     """
     if (
         not isinstance(record, dict) or record.get("kind", "oauth") != "oauth"
@@ -393,7 +394,7 @@ def format_tier(
     surfaces hold on their snapshot rows)."""
     tier = _known_label(tier)
     if tier is None and tier_error == "http-401":
-        return RELOGIN_TIER_TEXT
+        return UNREAD_TIER_TEXT
     parts: list[str] = []
     if tier is not None:
         parts.append(_COMPACT.get(tier, tier) if compact else tier)
@@ -430,7 +431,7 @@ __all__ = [
     "FABLE_MODEL_NAME",
     "PlanTier",
     "RECORD_KEYS",
-    "RELOGIN_TIER_TEXT",
+    "UNREAD_TIER_TEXT",
     "PROFILE_IDENTITY_KEY",
     "TIER_RETRY_S",
     "TIER_TTL_S",

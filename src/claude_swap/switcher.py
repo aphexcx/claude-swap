@@ -6172,7 +6172,7 @@ class ClaudeAccountSwitcher:
         # A server-rejected token is not a finished probe: the collect pass
         # may refresh it and probe again with the accepted replacement, so
         # the caller must keep the slot in its follow-up set rather than
-        # leave a "re-login needed" note standing for the retry interval.
+        # leave the tier unread for the retry interval.
         return outcome.error != "http-401"
 
     def _probe_credential_for(
