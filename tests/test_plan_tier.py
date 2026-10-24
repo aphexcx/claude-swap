@@ -96,6 +96,24 @@ class TestTierLabel:
     def test_pro_flag_alone(self):
         assert plan_tier.tier_label(None, None, has_claude_pro=True) == "Pro"
 
+    @pytest.mark.parametrize("tier", ["default_claude_pro", "default_claude_pro_2026"])
+    def test_known_pro_tier_without_flags_or_org(self, tier):
+        assert plan_tier.tier_label(tier, None) == "Pro"
+
+    def test_pro_org_alone(self):
+        assert plan_tier.tier_label(None, "claude_pro") == "Pro"
+
+    @pytest.mark.parametrize(
+        "tier, org_type",
+        [
+            ("default_provisional_x", None),
+            ("default_approved", "claude_zebra"),
+            ("default_claude_provisional", None),
+        ],
+    )
+    def test_pro_substring_in_unknown_tier_is_shown_verbatim(self, tier, org_type):
+        assert plan_tier.tier_label(tier, org_type) == tier
+
     def test_team_with_unrecognised_tier_shows_raw(self):
         assert plan_tier.tier_label("default_new_thing", "claude_team") == "default_new_thing"
 

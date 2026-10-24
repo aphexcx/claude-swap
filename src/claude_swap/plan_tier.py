@@ -113,8 +113,9 @@ def tier_label(
         default_claude_max_5x  / claude_team  -> "Team premium"
         default_raven          / claude_team  -> "Team standard"
 
-    Plus: ``claude_enterprise`` -> "Enterprise"; ``has_claude_pro`` (or a
-    tier / org type naming ``pro``) -> "Pro". Enterprise and Team are
+    Plus: ``claude_enterprise`` -> "Enterprise"; ``has_claude_pro``, org
+    type ``claude_pro``, or tier ``default_claude_pro`` (optionally followed
+    by an underscore suffix) -> "Pro". Enterprise and Team are
     decided by the org type first because a Team seat's tier string reuses
     the Max vocabulary (``default_claude_max_5x``), and Max is decided
     before Pro because a Max account may also report ``has_claude_pro``.
@@ -142,7 +143,10 @@ def tier_label(
         if tier:
             return rate_limit_tier.strip()  # type: ignore[union-attr]
         return "Max"
-    if has_claude_pro or org_type == "claude_pro" or "pro" in tier:
+    if (
+        has_claude_pro or org_type == "claude_pro"
+        or tier == "default_claude_pro" or tier.startswith("default_claude_pro_")
+    ):
         return "Pro"
     if tier:
         return rate_limit_tier.strip()  # type: ignore[union-attr]
