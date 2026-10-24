@@ -349,6 +349,10 @@ class _AccountInfo(tuple):
             record.get("kind", "oauth"), record.get("email"),
             record.get("organizationUuid") or "", record.get("authGeneration"),
         )
+        result.tier_identity = {
+            key: record.get(key)
+            for key in ("uuid", "email", "organizationUuid", "authGeneration")
+        }
         return result
 
 
@@ -1968,7 +1972,7 @@ class ClaudeAccountSwitcher:
                         if kind == "gateway"
                         else None
                     ),
-                    **self._tier_snapshot_fields(seq_data, n),
+                    **self._tier_snapshot_fields(seq_data, n, _creds),
                 )
             )
         return AccountsSnapshot(
@@ -1977,11 +1981,11 @@ class ClaudeAccountSwitcher:
             taken_at=self._usage_store.clock(),
         )
 
-    @staticmethod
-    def _tier_snapshot_fields(seq_data: dict, account_num: str) -> dict:
+    def _tier_snapshot_fields(self, seq_data: dict, account_num: str, creds: str | None = None) -> dict:
         """``AccountSnapshot`` tier kwargs from an already-loaded roster."""
         record = seq_data.get("accounts", {}).get(str(account_num))
-        if not isinstance(record, dict):
+        record = self._tier_record_for(account_num, record, creds)
+        if record.get("kind", "oauth") != "oauth":
             return {}
         tier = record.get("planTier")
         access = record.get("fableAccess")
@@ -5736,6 +5740,7 @@ class ClaudeAccountSwitcher:
             )
             if (
                 num in profile_due
+                and self._tier_info_eligible(info)
                 and record.access_token
                 and record.error is None
                 and record.sentinel is None
@@ -5878,7 +5883,12 @@ class ClaudeAccountSwitcher:
             # Tier label + Fable flag ride on the accepted successes. Best
             # effort by contract: the usage measurement is already committed,
             # and a label-cache hiccup must never surface as a fetch failure.
-            self._persist_tier_from_records(accepted_records, identities)
+            self._persist_tier_from_records(
+                {num: record for num, record in accepted_records.items()
+                 if self._tier_info_eligible(info_by_num[num])},
+                {num: getattr(info, "tier_identity", identities[num])
+                 for num, info in info_by_num.items()},
+            )
             entries = store.entries(identities, models)
             # A fetch that just returned invalid_grant advances the strike to the
             # dead threshold. The pre-fetch quarantine scan above couldn't see it,
@@ -5913,6 +5923,32 @@ class ClaudeAccountSwitcher:
         }
 
     # -- plan tier (subscription tier + Fable access) ---------------------
+
+    @staticmethod
+    def _profile_capable_credential(creds: str) -> bool:
+        """Raw add-token seats have inference-only scopes, not a profile."""
+        if looks_like_api_key(creds):
+            return False
+        scopes = (oauth.extract_oauth_data(creds) or {}).get("scopes")
+        return not isinstance(scopes, list) or not scopes or "user:profile" in scopes
+
+    def _tier_info_eligible(self, info) -> bool:
+        return (
+            self._account_info_kind(info) == "oauth"
+            and self._profile_capable_credential(info[5])
+        )
+
+    def _tier_record_for(self, num: str, record: dict | None, creds: str | None = None) -> dict:
+        """Filter display metadata without changing a seat's stored kind."""
+        if not isinstance(record, dict):
+            return {}
+        if record.get("kind", "oauth") != "oauth":
+            return record
+        if creds is None:
+            creds = self._read_account_credentials(str(num), record.get("email", ""))
+        if not self._profile_capable_credential(creds):
+            return {"kind": "setup_token"}
+        return record
 
     def _tier_due_slots(
         self,
@@ -5963,7 +5999,7 @@ class ClaudeAccountSwitcher:
     def _persist_tier_from_records(
         self,
         records: dict[str, FetchRecord],
-        identities: "dict[str, tuple[str, str]] | None" = None,
+        identities: "dict[str, tuple[str, str] | dict] | None" = None,
     ) -> None:
         """Write the tier/Fable facts the given successful records carry.
         Never raises (see ``_persist_tier_fields``)."""
@@ -5980,7 +6016,7 @@ class ClaudeAccountSwitcher:
     def _persist_tier_fields(
         self,
         updates: dict[str, dict],
-        identities: "dict[str, tuple[str, str]] | None" = None,
+        identities: "dict[str, tuple[str, str] | dict] | None" = None,
     ) -> None:
         """Merge per-slot tier fields into ``sequence.json`` under the account
         lock, re-reading first so a concurrent alias/disable edit is never
@@ -6008,12 +6044,15 @@ class ClaudeAccountSwitcher:
                 changed = False
                 for num, fields in updates.items():
                     record = accounts.get(str(num))
-                    if not isinstance(record, dict):
+                    if not isinstance(record, dict) or record.get("kind", "oauth") != "oauth":
                         continue  # slot removed since the fetch started
                     expected = identities.get(str(num)) if identities else None
+                    if isinstance(expected, tuple):
+                        expected = {"email": expected[0], "organizationUuid": expected[1]}
                     if expected is not None and (
-                        (record.get("email") or "") != (expected[0] or "")
-                        or (record.get("organizationUuid") or "") != (expected[1] or "")
+                        plan_tier.identity_disagrees(expected, record)
+                        or ("authGeneration" in expected
+                            and expected["authGeneration"] != record.get("authGeneration"))
                     ):
                         self._logger.debug(
                             "Slot %s changed identity during the tier read; "
@@ -6055,8 +6094,19 @@ class ClaudeAccountSwitcher:
         under the lock before the merge. Must NOT be called under a lock."""
         token = oauth.extract_access_token(creds)
         data = oauth.extract_oauth_data(creds)
-        if not token or not data or oauth.is_oauth_token_expired(data.get("expiresAt")):
+        if (
+            not token or not data or not self._profile_capable_credential(creds)
+            or oauth.is_oauth_token_expired(data.get("expiresAt"))
+        ):
             return False
+        record = (self._get_sequence_data() or {}).get("accounts", {}).get(str(account_num), {})
+        if record.get("kind", "oauth") != "oauth":
+            return False
+        if identity is not None and plan_tier.identity_disagrees(
+            {"email": identity[0], "organizationUuid": identity[1]}, record
+        ):
+            return False
+        expected = {key: record.get(key) for key in ("uuid", "email", "organizationUuid", "authGeneration")}
         outcome = oauth.fetch_oauth_plan_profile(token)
         now = self._usage_store.clock()
         fields: dict
@@ -6072,7 +6122,7 @@ class ClaudeAccountSwitcher:
             fields = plan_tier.tier_error_fields(outcome.error or "unknown", now)
         self._persist_tier_fields(
             {str(account_num): fields},
-            {str(account_num): identity} if identity is not None else None,
+            {str(account_num): expected},
         )
         # A server-rejected token is not a finished probe: the collect pass
         # may refresh it and probe again with the accepted replacement, so
@@ -6116,8 +6166,9 @@ class ClaudeAccountSwitcher:
         actually probed; slots with no usable live access token are skipped
         (the collect pass is asked to probe those after its own refresh)."""
         probed: set[str] = set()
-        for num, email, _org, org_uuid, is_active, creds, _alias in accounts_info:
-            if not creds or looks_like_api_key(creds):
+        for info in accounts_info:
+            num, email, _org, org_uuid, is_active, creds, _alias = info
+            if not creds or not self._tier_info_eligible(info):
                 continue
             n = str(num)
             probe_creds = self._probe_credential_for(n, email, org_uuid or "", is_active, creds)
@@ -6135,10 +6186,19 @@ class ClaudeAccountSwitcher:
             return {}
         out: dict[str, str] = {}
         for num, record in data.get("accounts", {}).items():
-            label = plan_tier.tier_display(record, compact=compact)
+            label = plan_tier.tier_display(self._tier_record_for(num, record), compact=compact)
             if label:
                 out[str(num)] = label
         return out
+
+    def plan_tier_fields(self) -> dict[str, dict]:
+        """Structured per-seat facts for auto --json; no network reads."""
+        data = self._get_sequence_data() or {}
+        return {
+            str(num): fields
+            for num, record in data.get("accounts", {}).items()
+            if (fields := plan_tier.tier_json_fields(self._tier_record_for(num, record)))
+        }
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
@@ -6584,7 +6644,7 @@ class ClaudeAccountSwitcher:
                         else None
                     ),
                     tier=plan_tier.tier_json_fields(
-                        seq_data.get("accounts", {}).get(str(num))
+                        self._tier_record_for(str(num), record, creds)
                     ),
                 )
             )
@@ -6653,7 +6713,7 @@ class ClaudeAccountSwitcher:
 
         seq_data = self._get_sequence_data() or {}
         print(bolded("Accounts:"))
-        for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
+        for i, (num, email, org_name, org_uuid, is_active, creds, alias) in enumerate(accounts_info):
             record = seq_data.get("accounts", {}).get(str(num), {})
             tag = (
                 gateway.tag(record)
@@ -6663,7 +6723,7 @@ class ClaudeAccountSwitcher:
             label = f"{accent(alias)} ({email})" if alias else email
             markers = ""
             tier_text = plan_tier.tier_display(
-                seq_data.get("accounts", {}).get(str(num))
+                self._tier_record_for(str(num), record, creds)
             )
             if tier_text:
                 markers += f" {muted(f'[{tier_text}]')}"
@@ -6807,7 +6867,7 @@ class ClaudeAccountSwitcher:
             )
         if alias:
             active["alias"] = alias
-        active.update(plan_tier.tier_json_fields(acct))
+        active.update(plan_tier.tier_json_fields(self._tier_record_for(account_num, acct)))
         if usage is not None:
             active.update(usage_freshness_fields(entry.fetched_at, entry.age_s))
         else:
@@ -6862,7 +6922,7 @@ class ClaudeAccountSwitcher:
                 account_num, current_email, current_org_uuid
             )
             tier_text = plan_tier.tier_display(
-                self._tier_record_after_fetch(account_num, data["accounts"][account_num])
+                self._tier_record_for(account_num, self._tier_record_after_fetch(account_num, record))
             )
             tier_part = f" {muted(f'[{tier_text}]')}" if tier_text else ""
             print(
@@ -6877,14 +6937,20 @@ class ClaudeAccountSwitcher:
         return None
 
     def _tier_record_after_fetch(self, account_num: str, fallback: dict) -> dict:
-        """The slot's roster record re-read after a collect pass (which may
-        have just persisted tier fields); ``fallback`` when unreadable."""
+        """Refresh tier fields without mixing different account snapshots."""
         try:
             data = self._get_sequence_data() or {}
         except ClaudeSwitchError:
             return fallback
         record = data.get("accounts", {}).get(str(account_num))
-        return record if isinstance(record, dict) else fallback
+        if (
+            not isinstance(record, dict)
+            or record.get("kind", "oauth") != fallback.get("kind", "oauth")
+            or record.get("authGeneration") != fallback.get("authGeneration")
+            or plan_tier.identity_disagrees(record, fallback)
+        ):
+            return fallback
+        return {**fallback, **{key: record[key] for key in plan_tier.RECORD_KEYS if key in record}}
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""

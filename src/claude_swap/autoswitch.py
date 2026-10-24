@@ -345,6 +345,8 @@ class PollEvent(AutoSwitchEvent):
     # Fable window used to be indistinguishable from an incomplete snapshot
     # in the tick line.
     tiers: dict[str, str] = field(default_factory=dict)
+    # Structured facts, keyed by slot, for consumers that must not parse labels.
+    account_tiers: dict[str, dict] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -360,6 +362,13 @@ class PollEvent(AutoSwitchEvent):
             fields["weeklyThreshold"] = self.weekly_threshold
         if self.tiers:
             fields["planTiers"] = self.tiers
+        if self.account_tiers:
+            fields["accountTiers"] = self.account_tiers
+            if self.active is not None:
+                fields["active"] = {
+                    **self.active,
+                    **self.account_tiers.get(str(self.active.get("number")), {}),
+                }
         return fields
 
     def _describe(self, num: str) -> str:
@@ -1259,6 +1268,7 @@ class AutoSwitchEngine:
                     ))
                 },
                 tiers=self._plan_tier_labels(),
+                account_tiers=self._plan_tier_fields(),
             )
         )
 
@@ -2586,6 +2596,15 @@ class AutoSwitchEngine:
         try:
             return dict(getter())
         except Exception:  # never let a label lookup break a tick
+            return {}
+
+    def _plan_tier_fields(self) -> dict[str, dict]:
+        getter = getattr(self.switcher, "plan_tier_fields", None)
+        if getter is None:
+            return {}
+        try:
+            return dict(getter())
+        except Exception:  # metadata must never interrupt switching
             return {}
 
     def _collect_scheduled_usage(

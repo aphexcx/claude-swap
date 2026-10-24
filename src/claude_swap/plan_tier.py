@@ -120,6 +120,8 @@ def tier_label(
     Anything unrecognised returns the raw ``rate_limit_tier`` (or, failing
     that, the raw ``organization_type``) so nothing is hidden.
     """
+    rate_limit_tier = _known_label(rate_limit_tier)
+    organization_type = _known_label(organization_type)
     tier = (rate_limit_tier or "").strip().lower()
     org_type = (organization_type or "").strip().lower()
 
@@ -352,7 +354,7 @@ def tier_display(
     profiled (API-key slots have no tier to show). A 401 on the profile with
     no cached tier renders :data:`RELOGIN_TIER_TEXT`.
     """
-    if not isinstance(record, dict):
+    if not isinstance(record, dict) or record.get("kind", "oauth") != "oauth":
         return None
     tier = record.get("planTier")
     access = record.get("fableAccess")
@@ -366,6 +368,11 @@ def tier_display(
     )
 
 
+def _known_label(value: object) -> str | None:
+    label = _str_or_none(value)
+    return None if label is None or label.lower() == "unknown" else label
+
+
 def format_tier(
     tier: str | None,
     fable_access: bool | None,
@@ -376,7 +383,7 @@ def format_tier(
 ) -> str | None:
     """:func:`tier_display` on already-extracted values (what interactive
     surfaces hold on their snapshot rows)."""
-    tier = tier.strip() if isinstance(tier, str) and tier.strip() else None
+    tier = _known_label(tier)
     if tier is None and tier_error == "http-401":
         return RELOGIN_TIER_TEXT
     parts: list[str] = []
@@ -393,13 +400,16 @@ def tier_json_fields(record: dict | None) -> dict:
     """Additive ``--json`` keys for an account row. Always emitted (null when
     unknown) so scripts can key on them without probing for presence."""
     rec = record if isinstance(record, dict) else {}
+    if rec.get("kind", "oauth") != "oauth":
+        return {}
     tier = rec.get("planTier")
     fetched_at = rec.get("tierFetchedAt")
     out: dict = {
-        "planTier": tier if isinstance(tier, str) else None,
+        "planTier": _known_label(tier),
         "rateLimitTier": rec.get("rateLimitTier") if isinstance(rec.get("rateLimitTier"), str) else None,
         "organizationType": rec.get("organizationType") if isinstance(rec.get("organizationType"), str) else None,
         "fableAccess": rec.get("fableAccess") if isinstance(rec.get("fableAccess"), bool) else None,
+        "fableWindow": rec.get("fableAccess") if isinstance(rec.get("fableAccess"), bool) else None,
         "tierFetchedAt": fetched_at if isinstance(fetched_at, str) else None,
     }
     err = rec.get("tierError")

@@ -382,7 +382,7 @@ class TestAutoswitchGateway:
         h = fleet(temp_home, monkeypatch)
         h.engine.settings = replace(h.settings, interval_seconds=360)
         monkeypatch.setattr(h.switcher, "_run_usage_fetches",
-                            lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(100)) for i in infos})
+                            lambda infos, pre, *, profile_due=frozenset(): {str(i[0]): FetchRecord(usage=_usage(100)) for i in infos})
         probes = []
         def probe(record, key, **kwargs):
             probes.append(h.clock())
@@ -411,7 +411,7 @@ class TestAutoswitchGateway:
         if mode == "no-candidates":
             h.switcher.remove_account("2", assume_yes=True)
         monkeypatch.setattr(h.switcher, "_run_usage_fetches",
-                            lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(100, _iso_at(h.clock() + 10000))) for i in infos})
+                            lambda infos, pre, *, profile_due=frozenset(): {str(i[0]): FetchRecord(usage=_usage(100, _iso_at(h.clock() + 10000))) for i in infos})
         probes = []
         def probe(record, key, **kwargs):
             probes.append(h.clock())
@@ -648,7 +648,7 @@ class TestAutoswitchGateway:
         monkeypatch.setattr(
             h.switcher,
             "_run_usage_fetches",
-            lambda infos, pre: {
+            lambda infos, pre, *, profile_due=frozenset(): {
                 str(i[0]): FetchRecord(usage=_usage(100)) for i in infos
             },
         )
@@ -726,7 +726,7 @@ def test_gateway_real_collector_resumes_after_oauth_idle_hold(temp_home, monkeyp
     recovered = False
     polled = []
 
-    def fetch(infos, pre):
+    def fetch(infos, pre, *, profile_due=frozenset()):
         polled.extend(str(i[0]) for i in infos)
         return {str(i[0]): FetchRecord(usage=_usage(10)) if recovered
                 else FetchRecord(sentinel=USAGE_TOKEN_EXPIRED) for i in infos}
@@ -769,7 +769,7 @@ def test_gateway_entry_captures_live_rotation_before_candidate_collection(temp_h
     h.switcher.switch_to("3", json_output=True)
     observed = {}
 
-    def fetch(infos, pre):
+    def fetch(infos, pre, *, profile_due=frozenset()):
         observed.update({str(i[0]): i[5] for i in infos})
         return {str(i[0]): FetchRecord(usage=_usage(10)) if i[5] == fresh
                 else FetchRecord(error="invalid_grant") for i in infos}
@@ -789,7 +789,7 @@ def test_gateway_unavailable_credential_has_bounded_departure(temp_home, monkeyp
     h.switcher.switch_to("3", json_output=True)
     read = h.switcher._read_account_credentials
     monkeypatch.setattr(h.switcher, "_read_account_credentials", lambda n, email: "" if n == "3" else read(n, email))
-    monkeypatch.setattr(h.switcher, "_run_usage_fetches", lambda infos, pre: {str(i[0]): FetchRecord(usage=_usage(10)) for i in infos})
+    monkeypatch.setattr(h.switcher, "_run_usage_fetches", lambda infos, pre, *, profile_due=frozenset(): {str(i[0]): FetchRecord(usage=_usage(10)) for i in infos})
     probe = Mock()
     monkeypatch.setattr(gateway, "probe", probe)
     assert h.engine.tick() == TickOutcome.NO_ACTION

@@ -76,7 +76,7 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Each account line also carries its **plan tier** and whether the seat has the per-model Fable window — e.g. `[Max 20x · Fable]`, `[Team premium · Fable]`, `[Team standard · no Fable]`, `[Pro]`. The tier comes from the account's profile (read at most once a day per account, cached next to the account's alias; `cswap list --refresh` re-reads it now), the Fable flag from the same usage payload the numbers come from, so a seat that loses Fable access shows `no Fable` on the next poll instead of a silently missing line. Unrecognised tiers show their raw tier string rather than a guess. The same label appears in `cswap status`, the TUI, the menu bar, the `cswap auto` tick line, and as additive `planTier`/`fableAccess` keys in `--json` output.
+Each OAuth account line includes its cached plan tier and Fable window, for example `1: user@example.com [personal] [Max 20x · Fable]` or `[Team standard · no Fable]`. Labels include Max 20x, Max 5x, Team premium, Team standard, Pro, and Enterprise; an unknown tier has no label. The next successful usage fetch fills the cache, profiles refresh daily (`cswap list --refresh` refreshes them now), and each usage fetch updates the Fable yes/no. Gateway and add-token seats show neither. List JSON exposes `planTier` and `fableWindow` (`true`, `false`, or `null` before usage is known); auto JSON includes those fields on `active` and in the slot-keyed `accountTiers` map.
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
@@ -191,7 +191,6 @@ cswap auto                      # Auto-switch when nearing rate limits (see abov
 cswap config                    # Show or edit settings (see Configuration below)
 cswap list                      # Show all accounts with 5h/7d usage and reset times
 cswap list --token-status       # Add source-labelled OAuth token diagnostics
-cswap list --refresh            # Re-read every account's plan tier now (else cached 24h)
 cswap status                    # Show current account
 cswap add --slot 3              # Add account to a specific slot (prompts before overwrite)
 cswap add --alias dev           # Add account and give it a short alias
@@ -359,8 +358,6 @@ Usage is served from a per-account cache: when the usage API is briefly unreacha
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
-
-Plan-tier fields are additive on every list row and on the managed active row from `status --json`: `planTier` (the label `cswap list` prints — `"Max 20x"`, `"Max 5x"`, `"Team premium"`, `"Team standard"`, `"Pro"`, `"Enterprise"`, or the raw tier string when unrecognised), `rateLimitTier` and `organizationType` (the profile's raw values), `fableAccess` (`true`/`false` from the latest usage payload — does the seat carry a per-model Fable window — or `null` when no usage has been read yet), and `tierFetchedAt` (when the tier was last read; it is cached for 24 h per account). All are `null` for accounts never profiled (API-key slots have no tier). A `tierError` key appears only when the last profile read failed (e.g. `"http-401"`); the cached tier is kept, never blanked, on a failed read, and a failing read is retried at most hourly.
 
 Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) additively carry pace fields once the week is ~a day old: `expectedPct` (where usage would sit if spread evenly across the week) and `aheadOfPace` (`true` when meaningfully above that — the same signal the human views show as an `(ahead)`/`(ahead of pace)` marker). `projectedExhaustionAt`/`willLastToReset` extrapolate the current rate into an ETA to 100% and a yes/no "will it last to the reset"; they stay `--json`-only since a linear projection is too rough to present as fact in the UI.
 

@@ -34,7 +34,7 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from claude_swap.locking import FileLock
@@ -275,8 +275,8 @@ class FetchRecord:
     # plan-tier profile read with a token known to be live. ``profile`` is
     # that read's outcome (``oauth.ProfileOutcome``) when the collector
     # asked for one this pass.
-    access_token: str | None = None
-    profile: object | None = None
+    access_token: str | None = field(default=None, repr=False)
+    profile: object | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)

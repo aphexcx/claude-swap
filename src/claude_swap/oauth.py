@@ -9,7 +9,7 @@ import sys
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from claude_swap.printer import warning as print_warning
@@ -670,7 +670,7 @@ class UsageOutcome:
     # plan-tier profile — with a token known to be live, including after a
     # refresh inside this call rotated the credential the caller passed.
     # In-memory only; never persisted or logged.
-    access_token: str | None = None
+    access_token: str | None = field(default=None, repr=False)
 
 
 def fetch_usage(access_token: str) -> dict | None:

@@ -234,13 +234,14 @@ class TestDisplayStrings:
 
 
 class TestJsonFields:
-    def test_always_emits_the_five_keys(self):
+    def test_emits_unknown_fields_for_an_oauth_seat(self):
         out = plan_tier.tier_json_fields(None)
         assert out == {
             "planTier": None,
             "rateLimitTier": None,
             "organizationType": None,
             "fableAccess": None,
+            "fableWindow": None,
             "tierFetchedAt": None,
         }
 
@@ -919,25 +920,24 @@ class TestTickLine:
         assert ev.human().endswith("| others: #2: 10%")
         assert "planTiers" not in ev._fields()
 
-    def test_tier_label_and_skip_marker_render_together(self):
-        # jadegate-integration seam: the ranking branch's skip marker and the
-        # label branch's tier suffix decorate the same candidate. Both must
-        # render, tier first, and both additive JSON key sets must be present.
+    def test_tier_label_and_fork_weekly_policy_render_together(self):
+        # Port of 3a9d3bc's rendering seam to the fork's policy: do not import
+        # jadegate's model-window skip/ranking behavior just for this test.
         ev = PollEvent(
             active={"number": 1, "email": "a@x.com"},
             headroom={"1": 60.0, "2": 90.0, "3": 40.0},
             threshold=90.0,
             windows={"2": {"5h": 10.0, "7d": 5.0}, "3": {"5h": 5.0, "7d": 10.0, "Fable": 60.0}},
             tiers={"2": "Team std · no Fable", "3": "Max 20x"},
-            skipped={"2": "model-window-missing"},
+            weekly_threshold=95.0,
         )
         line = ev.human()
-        assert "#2: 5h 10% · 7d 5% · Team std · no Fable (skipped: model-window-missing)" in line
+        assert "#2: 5h 10% · 7d 5% · Team std · no Fable" in line
         assert "#3: 5h 5% · 7d 10% · Fable 60% · Max 20x" in line
         assert "skipped" not in line.split("#3:")[1]
         payload = ev.to_json()
         assert payload["planTiers"] == {"2": "Team std · no Fable", "3": "Max 20x"}
-        assert payload["skippedCandidates"] == {"2": "model-window-missing"}
+        assert payload["weeklyThreshold"] == 95.0
 
 
 class TestFetchRecordInMemoryFields:
@@ -961,3 +961,107 @@ class TestFetchRecordInMemoryFields:
         assert fields["tierError"] == "no-tier-fields"
         assert fields["tierAttemptedAt"] == "1970-01-01T00:00:00Z"
         assert "planTier" not in fields
+
+
+class TestForkTierContract:
+    @pytest.mark.parametrize("kind", ["gateway", "setup_token", "api_key"])
+    def test_add_token_seats_have_no_tier_or_fable_fields(self, temp_home, monkeypatch, capsys, kind):
+        from claude_swap import gateway
+
+        monkeypatch.setattr(gateway, "executable", lambda: "/fake/bin/cswap")
+        switcher = ClaudeAccountSwitcher()
+        token = "sk-ant-api03-test" if kind == "api_key" else "sk-ant-oat01-test"
+        options = {"base_url": "https://gateway.example.test"} if kind == "gateway" else {}
+        switcher.add_account_from_token(token, email="custom@example.test", slot=1, **options)
+        capsys.readouterr()
+        # Even imported or leftover metadata must not imply these seats have
+        # subscription windows. The record's real kind must stay unchanged.
+        data = switcher._get_sequence_data()
+        original_kind = data["accounts"]["1"].get("kind", "oauth")
+        data["accounts"]["1"].update(planTier="Max 20x", fableAccess=True)
+        switcher._write_json(switcher.sequence_file, data)
+        with patch("claude_swap.oauth.fetch_oauth_plan_profile") as profile:
+            switcher.list_accounts(refresh=True, fetch=set())
+            text = capsys.readouterr().out
+            payload = switcher.list_accounts(json_output=True, fetch=set())
+            snapshot = switcher.accounts_snapshot(fetch=set())
+        profile.assert_not_called()
+        assert "Max 20x" not in text and "Fable" not in text
+        row = payload["accounts"][0]
+        assert "planTier" not in row and "fableWindow" not in row and "fableAccess" not in row
+        assert snapshot.accounts[0].tier_label is None
+        assert switcher.plan_tier_labels() == {}
+        assert switcher.plan_tier_fields() == {}
+        assert _record(switcher, "1").get("kind", "oauth") == original_kind
+
+    def test_list_json_first_fetch_includes_boolean_window(self, temp_home, mock_claude_config, sample_sequence_data):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        payload, _ = TestCollectorPersistsTier()._run_list(
+            switcher, oauth.UsageOutcome(USAGE_NO_FABLE, access_token="sk-accepted"),
+            oauth.ProfileOutcome(TEAM_STANDARD), json_output=True,
+        )
+        assert all(row["planTier"] == "Team standard" and row["fableWindow"] is False
+                   for row in payload["accounts"])
+
+    def test_list_without_a_tier_has_no_unknown_label(self, temp_home, mock_claude_config, sample_sequence_data, capsys):
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        switcher.list_accounts(fetch=set())
+        output = capsys.readouterr().out
+        assert "test@example.com [personal] (active)" in output
+        assert "unknown]" not in output and "Fable]" not in output
+
+    def test_auto_tick_carries_structured_active_and_candidate_tiers(self, temp_home):
+        from tests.test_autoswitch import EngineHarness, _usage
+
+        harness = EngineHarness(temp_home)
+        harness.seed(1, "a@example.com")
+        harness.seed(2, "b@example.com")
+        harness.make_live("a@example.com", 1)
+        data = harness.switcher._get_sequence_data()
+        data["accounts"]["1"].update(planTier="Max 20x", fableAccess=True)
+        data["accounts"]["2"].update(planTier="Team standard", fableAccess=False)
+        harness.switcher._write_json(harness.switcher.sequence_file, data)
+        harness.tick_with_usage({"1": _usage(20), "2": _usage(30)})
+        poll = next(event for event in harness.events if isinstance(event, PollEvent))
+        payload = poll.to_json()
+        assert payload["active"]["planTier"] == "Max 20x"
+        assert payload["active"]["fableWindow"] is True
+        assert payload["accountTiers"]["2"]["planTier"] == "Team standard"
+        assert payload["accountTiers"]["2"]["fableWindow"] is False
+        assert "Max 20x" in poll.human() and "Team std · no Fable" in poll.human()
+
+    @pytest.mark.parametrize("change", ["uuid", "authGeneration", "kind"])
+    def test_tier_persist_drops_replaced_identity_or_auth_generation(self, temp_home, sample_sequence_data, change):
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        original = dict(_record(switcher, "1"), authGeneration="original")
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"].update(original)
+        data["accounts"]["1"][change] = "gateway" if change == "kind" else "replacement"
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._persist_tier_fields({"1": {"planTier": "Pro", "fableAccess": True}}, {"1": original})
+        assert "planTier" not in _record(switcher, "1")
+        assert "fableAccess" not in _record(switcher, "1")
+
+    def test_same_uuid_keeps_tier_across_an_email_change_during_fetch(self, temp_home, sample_sequence_data):
+        switcher = ClaudeAccountSwitcher()
+        _seed(switcher, sample_sequence_data)
+        original = dict(_record(switcher, "1"))
+        data = switcher._get_sequence_data()
+        data["accounts"]["1"]["email"] = "renamed@example.com"
+        switcher._write_json(switcher.sequence_file, data)
+        switcher._persist_tier_fields({"1": {"planTier": "Pro"}}, {"1": original})
+        assert _record(switcher, "1")["planTier"] == "Pro"
+
+    def test_unknown_string_is_not_a_tier_label(self):
+        assert plan_tier.tier_display({"planTier": "unknown"}) is None
+        assert plan_tier.tier_json_fields({"planTier": "unknown"})["planTier"] is None
+        assert plan_tier.tier_from_profile(_profile("unknown", "unknown")) is None
+
+    def test_accepted_token_and_raw_profile_are_not_in_reprs(self):
+        assert "test-secret" not in repr(oauth.UsageOutcome(None, access_token="test-secret"))
+        assert "test-secret" not in repr(FetchRecord(access_token="test-secret", profile={"data": "test-secret"}))
