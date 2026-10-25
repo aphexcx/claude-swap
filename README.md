@@ -76,7 +76,7 @@ Not sure which one? `cswap list` is the dashboard — every account's 5-hour and
 cswap list
 ```
 
-Each OAuth account line includes its cached plan tier and Fable window, for example `1: user@example.com [personal] [Max 20x · Fable]` or `[Team standard · no Fable]`. Labels include Max 20x, Max 5x, Team premium, Team standard, Pro, and Enterprise; an unknown tier has no label. The next successful usage fetch fills the cache, profiles refresh daily (`cswap list --refresh` refreshes them now), and each usage fetch updates the Fable yes/no. Gateway and add-token seats show neither. List JSON exposes `planTier` and `fableWindow` (`true`, `false`, or `null` before usage is known); auto JSON includes those fields on `active` and in the slot-keyed `accountTiers` map.
+Each OAuth account line includes its cached plan tier and Fable window, for example `1: user@example.com [personal] [Max 20x · Fable]` or `[Team standard · no Fable]`. Labels include Max 20x, Max 5x, Team premium, Team standard, Pro, and Enterprise; an unrecognised tier shows its raw identifier, while missing tier data and the literal `unknown` have no tier label. The next successful usage fetch fills the cache, profiles refresh daily (`cswap list --refresh` refreshes them now), and each usage fetch updates the Fable yes/no. Gateway and add-token seats show neither. List JSON exposes `planTier` and `fableWindow` (`true`, `false`, or `null` before usage is known); auto JSON includes those fields on `active` and in the slot-keyed `accountTiers` map.
 
 Or let claude-swap auto-pick by remaining quota — `cswap switch --strategy best` (most quota left) or `--strategy next-available` (skip rate-limited accounts).
 
